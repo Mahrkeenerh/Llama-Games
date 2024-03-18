@@ -66,16 +66,16 @@ class Vixtral(torch.nn.Module):
             self.vit = None
         else:
             self.vit = vit_load_func()
-            self.init_vit(image_size)
+            self._init_vit(image_size)
 
         assert mixtral_load_func is not None, "Mixtral model must be provided."
 
         self.mixtral, self.tokenizer = mixtral_load_func()
-        self.init_mixtral()
+        self._init_mixtral()
 
-        self.init_embed_projector(projector_path)
+        self._init_embed_projector(projector_path)
 
-    def init_vit(self, image_size):
+    def _init_vit(self, image_size):
         """Apply custom modifications to the ViT model."""
 
         if self.vit is None:
@@ -112,7 +112,7 @@ class Vixtral(torch.nn.Module):
 
         self.vit.eval()
 
-    def init_mixtral(self):
+    def _init_mixtral(self):
         """Apply custom modifications to the Mixtral model.
         Like LORA, Adapters or something, nothing yet."""
         
@@ -121,6 +121,21 @@ class Vixtral(torch.nn.Module):
             param.requires_grad = False
 
         self.mixtral.eval()
+
+    def _init_embed_projector(self, projector_path):
+        """Initialize the projector from ViT to Mixtral embeds."""
+
+        image_embed_size = self.vit.embeddings.patch_embeddings.projection.out_channels
+        word_embed_size = self.mixtral.get_input_embeddings().embedding_dim
+
+        self.embed_projector = torch.nn.Linear(
+            image_embed_size * 4,
+            word_embed_size,
+            device=self.device
+        )
+
+        if projector_path is not None:
+            self.load_projector(projector_path)
 
     def save_projector(self, path):
         if self.is_distributed:
@@ -138,21 +153,6 @@ class Vixtral(torch.nn.Module):
 
         projector.load_state_dict(torch.load(path))
 
-    def init_embed_projector(self, projector_path):
-        """Initialize the projector from ViT to Mixtral embeds."""
-
-        image_embed_size = self.vit.embeddings.patch_embeddings.projection.out_channels
-        word_embed_size = self.mixtral.get_input_embeddings().embedding_dim
-
-        self.embed_projector = torch.nn.Linear(
-            image_embed_size * 4,
-            word_embed_size,
-            device=self.device
-        )
-
-        if projector_path is not None:
-            self.load_projector(projector_path)
-
     def set_optimizer(self, optim, lr):
         """Set the optimizer for the ViXtral model."""
 
@@ -160,7 +160,7 @@ class Vixtral(torch.nn.Module):
 
         return self.optimizer
 
-    def prepare_mixtral_input(self, project_embed, labels):
+    def _prepare_mixtral_input(self, project_embed, labels):
         """Concat project_embeds with labels, prepare input_ids, attentions."""
 
         label_embeds = self.mixtral.get_input_embeddings()(labels)
@@ -169,7 +169,7 @@ class Vixtral(torch.nn.Module):
         attentions = torch.ones(inputs_embeds.size()[:-1], device=self.device)
 
         label_ids = torch.cat((torch.full((project_embed.size()[:-1]), -100, device=self.device), labels), dim=1)
-        
+
         return inputs_embeds, attentions, label_ids
 
     def distribute(self, local_rank):
@@ -205,7 +205,7 @@ class Vixtral(torch.nn.Module):
 
         projected_embed = self.embed_projector(encoder_outputs).type(torch.float16)
 
-        inputs_embeds, attentions, label_ids = self.prepare_mixtral_input(projected_embed, labels)
+        inputs_embeds, attentions, label_ids = self._prepare_mixtral_input(projected_embed, labels)
 
         mixtral_out = self.mixtral(
             inputs_embeds=inputs_embeds,

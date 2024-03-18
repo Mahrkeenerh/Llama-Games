@@ -33,9 +33,9 @@ class AppDataset(torch.utils.data.Dataset):
         if self.verbose:
             print("Loading datafile...")
 
-        self.load_datafile(root, data_name, images_subdir)
+        self._load_datafile(root, data_name, images_subdir)
 
-    def load_datafile(self, root, data_name, images_subdir):
+    def _load_datafile(self, root, data_name, images_subdir):
         data_json = json.load(open(os.path.join(root, data_name), "r", encoding="utf-8"))
         dataset_raw = {
             app["appId"]: {"image_paths": [], "description": app["description"]}
@@ -65,7 +65,7 @@ class AppDataset(torch.utils.data.Dataset):
 
         self.labels =  [None] * len(self.descriptions)
 
-    def item_tokenize(self, idx):
+    def _item_tokenize(self, idx):
         if self.tokenizer is None:
             self.labels[idx] = self.descriptions[idx]
             return
@@ -110,7 +110,7 @@ class AppDataset(torch.utils.data.Dataset):
             ))
 
         if self.labels[idx] is None:
-            self.item_tokenize(idx)
+            self._item_tokenize(idx)
         label = self.labels[idx]
 
         return image_paths, label
