@@ -21,7 +21,7 @@ def init():
     return local_rank, device
 
 
-def load_vixtral(image_size, image_stack_size, device, local_rank):
+def load_vixtral(image_size, lora_r, device, local_rank):
     vit_load = lambda : modeling.load_VED_vit(
         model_path="/home/xbuban1/ved_model",
         device=device
@@ -35,8 +35,8 @@ def load_vixtral(image_size, image_stack_size, device, local_rank):
     vixtral = modeling.Vixtral(
         vit_load_func=vit_load,
         image_size=image_size,
-        image_stack_size=image_stack_size,
         mixtral_load_func=mixtral_load,
+        lora_r=lora_r,
         projector_path=None,
         device=device
     )
@@ -149,15 +149,19 @@ def main():
     local_rank, device = init()
 
     image_size = 448
-    image_stack_size = 6
 
-    vixtral = load_vixtral(image_size, image_stack_size, device, local_rank)
+    vixtral = load_vixtral(
+        image_size,
+        lora_r=64,
+        device=device,
+        local_rank=local_rank
+    )
     optimizer = vixtral.set_optimizer(torch.optim.Adam, lr=1e-4)
 
     train_loader, val_loader = load_data(
         tokenizer=vixtral.tokenizer,
         image_size=image_size,
-        image_stack_size=image_stack_size,
+        image_stack_size=6,
         max_label_length=512,
         minibatch_size=1,
         device=device,
