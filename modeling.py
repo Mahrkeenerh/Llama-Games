@@ -174,7 +174,7 @@ class Vixtral(torch.nn.Module):
     def set_optimizer(self, optim, lr):
         """Set the optimizer for the ViXtral model."""
 
-        self.optimizer = optim(self.embed_projector.parameters(), lr=lr)
+        self.optimizer = optim(self.parameters(), lr=lr)
 
         return self.optimizer
 
