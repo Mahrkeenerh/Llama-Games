@@ -13,14 +13,14 @@ class AppDataset(torch.utils.data.Dataset):
             root,
             data_name,
             images_subdir,
-            image_stack_size=8,
+            max_image_stack_size=8,
             tokenizer=None,
             max_label_length=512,
             device=None,
             seed=None,
             verbose=False
         ):
-        self.image_stack_size = image_stack_size
+        self.max_image_stack_size = max_image_stack_size
         self.tokenizer = tokenizer
         self.max_label_length = max_label_length
 
@@ -97,10 +97,10 @@ class AppDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         probabilites = self._generate_probabilities(len(self.image_paths[idx]))
-        generating_count = min(self.image_stack_size, len(self.image_paths[idx]))
+        generating_count = min(self.max_image_stack_size, len(self.image_paths[idx]))
         
         # Random sample from image paths based on probabilities
-        # Choose maximum image_stack_size images
+        # Choose maximum max_image_stack_size images
         # If there are less images, return only those
         image_paths = self.rnd_state.choice(
             self.image_paths[idx],
