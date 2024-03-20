@@ -97,23 +97,33 @@ class AppDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         probabilites = self._generate_probabilities(len(self.image_paths[idx]))
-        image_paths = []
+        generating_count = min(self.image_stack_size, len(self.image_paths[idx]))
+        
+        # Random sample from image paths based on probabilities
+        # Choose maximum image_stack_size images
+        # If there are less images, return only those
+        image_paths = self.rnd_state.choice(
+            self.image_paths[idx],
+            size=generating_count,
+            replace=False,
+            p=probabilites
+        )
 
-        # Keep randomly adding images - if less, all will be included at least once
-        while len(image_paths) < self.image_stack_size:
-            generating_count = min(self.image_stack_size - len(image_paths), len(self.image_paths[idx]))
-            image_paths.extend(self.rnd_state.choice(
-                self.image_paths[idx],
-                size=generating_count,
-                replace=False,
-                p=probabilites
-            ))
+        # Load images
+        images = []
+        for path in image_paths:
+            image = torchvision.io.read_image(
+                path,
+                torchvision.io.ImageReadMode.RGB
+            )
+            images.append(image)
 
+        # Tokenize label if not already done
         if self.labels[idx] is None:
             self._item_tokenize(idx)
         label = self.labels[idx]
 
-        return image_paths, label
+        return images, label
 
 
 class AppDataLoader(torch.utils.data.DataLoader):
@@ -123,14 +133,14 @@ class AppDataLoader(torch.utils.data.DataLoader):
             batch_size,
             shuffle=True,
             image_size=448,
-            do_prepcocess=True,
+            processor=None,
             tokenizer=None,
             max_label_length=512,
             device=None,
             sampler=None
         ):
         self.image_size = image_size
-        self.do_prepcocess = do_prepcocess
+        self.processor = processor
 
         self.tokenizer = tokenizer
         self.max_label_length = max_label_length
@@ -156,12 +166,8 @@ class AppDataLoader(torch.utils.data.DataLoader):
     def collate_fn(self, batch):
         images, labels = zip(*list(batch))
 
-        images = self._load_images(images)
-        images = self._image_crop(images)
-        images = self._image_pad(images)
-
-        if self.do_prepcocess:
-            images = self._image_normalize(images)
+        if self.processor is not None:
+            images = self._image_preprocess(images)
 
         if self.tokenizer is not None:
             labels = self._batch_tokenize(labels)
@@ -172,6 +178,38 @@ class AppDataLoader(torch.utils.data.DataLoader):
         labels = labels.to(self.device)
 
         return images, labels
+
+    def _image_preprocess(self, images):
+        """Preprocess images using the processor.
+        
+        Receives a 2D list of images (5D list):
+        [
+            [image1, image2, image3, ...],
+            [image1, image2, image3, ...],
+            ...
+        ]
+        
+        Returns a tensor of tensors of batched images (5D tensor):
+        [
+            [image0_0, image1_0, image2_0, ...],
+            [image0_1, image1_1, image2_1, ...],
+            ...
+        ]
+        """
+
+        preprocessed_images = []
+
+        for image_stack in images:
+            preprocessed_stack = self.processor(
+                image_stack,
+                return_tensors="pt"
+            ).pixel_values
+
+            preprocessed_images.append(preprocessed_stack)
+
+        images = torch.stack(preprocessed_images, dim=1)
+
+        return images
 
     def _batch_tokenize(self, labels):
         """Tokenize pad and truncate batch labels."""
@@ -185,118 +223,3 @@ class AppDataLoader(torch.utils.data.DataLoader):
         )
 
         return tokenized["input_ids"]
-
-    def _load_images(self, image_paths):
-        """Receives a 2D list of image paths:
-        [
-            [path1, path2, path3, ...],
-            [path1, path2, path3, ...],
-            ...
-        ]
-
-        Returns a 2D lsit of images (5D list):
-        [
-            [image1, image2, image3, ...],
-            [image1, image2, image3, ...],
-            ...
-        ]
-        """
-
-        images = []
-
-        for path_stack in image_paths:
-            image_stack = []
-
-            for path in path_stack:
-                image = torchvision.io.read_image(
-                    path,
-                    torchvision.io.ImageReadMode.RGB
-                )
-                image_stack.append(image)
-
-            images.append(image_stack)
-
-        return images
-
-    def _image_crop(self, images):
-        """Randomly crop images to self.image_size x self.image_size.
-
-        Receives a 2D list of images (5D list):
-        [
-            [image1, image2, image3, ...],
-            [image1, image2, image3, ...],
-            ...
-        ]
-
-        Returns the same data format.
-        """
-
-        cropped_images = []
-
-        for image_stack in images:
-            cropped_stack = []
-
-            for image in image_stack:
-                h = image.shape[-2]
-                w = image.shape[-1]
-
-                h_start = random.randint(0, max(h - self.image_size, 0))
-                w_start = random.randint(0, max(w - self.image_size, 0))
-
-                h_end = min(h_start + self.image_size, h)
-                w_end = min(w_start + self.image_size, w)
-
-                cropped_image = image[..., h_start:h_end, w_start:w_end]
-                cropped_stack.append(cropped_image)
-
-            cropped_images.append(cropped_stack)
-
-        return cropped_images
-
-    def _image_pad(self, images):
-        """Receives a 2D list of images (5D list):
-        [
-            [image1, image2, image3, ...],
-            [image1, image2, image3, ...],
-            ...
-        ]
-
-        Returns a tensor of tensors of batched images (5D tensor):
-        [
-            [image0_0, image1_0, image2_0, ...],
-            [image0_1, image1_1, image2_1, ...],
-            ...
-        ]
-        """
-
-        padded_images = []
-
-        for image_stack in images:
-            padded_stack = []
-
-            for image in image_stack:
-                h = image.shape[-2]
-                w = image.shape[-1]
-                h_start = (self.image_size - h) // 2
-                w_start = (self.image_size - w) // 2
-
-                padded_image = torch.nn.functional.pad(image, (
-                    w_start,
-                    self.image_size - w - w_start,
-                    h_start,
-                    self.image_size - h - h_start
-                ), value=0)
-                padded_stack.append(padded_image)
-
-            padded_images.append(padded_stack)
-
-        images = torch.stack([torch.stack(image_stack, dim=0) for image_stack in padded_images], dim=1)
-
-        return images
-
-    def _image_normalize(self, images):
-        # Mean 0.5 and std 0.5, same as pretrained ViTImageProcessor
-        images = images / 255.0
-        images = (images - 0.5) / 0.5
-
-        return images

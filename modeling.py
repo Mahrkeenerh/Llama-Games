@@ -1,6 +1,6 @@
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import torch
-from transformers import LlamaTokenizerFast, MixtralForCausalLM, BitsAndBytesConfig, VisionEncoderDecoderModel
+from transformers import LlamaTokenizerFast, MixtralForCausalLM, BitsAndBytesConfig, VisionEncoderDecoderModel, ViTImageProcessor 
 
 
 def load_VED_vit(model_path, device):
@@ -15,7 +15,10 @@ def load_VED_vit(model_path, device):
     del ved_model.decoder
     torch.cuda.empty_cache()
 
-    return ved_model.encoder
+    vit_processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+    vit_processor.size = {"width": 448, "height": 448}
+
+    return ved_model.encoder, vit_processor
 
 
 def load_mixtral(model_path, load_4bit, device):
@@ -65,8 +68,9 @@ class Vixtral(torch.nn.Module):
 
         if vit_load_func is None:
             self.vit = None
+            self.vit_processor = None
         else:
-            self.vit = vit_load_func()
+            self.vit, self.vit_processor = vit_load_func()
             self._init_vit(image_size)
 
         assert mixtral_load_func is not None, "Mixtral model must be provided."
@@ -85,10 +89,6 @@ class Vixtral(torch.nn.Module):
         if self.vit is None:
             return
 
-        # self.vit.config.encoder.image_size = IMAGE_SIZE
-
-        self.vit.embeddings.patch_embeddings.do_rescale = False
-        self.vit.embeddings.patch_embeddings.do_resize = False
         self.vit.embeddings.patch_embeddings.image_size = [image_size, image_size]
 
         # Upscale position embeddings
@@ -132,8 +132,6 @@ class Vixtral(torch.nn.Module):
                 task_type="CAUSAL_LM"
             )
             self.mixtral = get_peft_model(mixtral, loraconfig)
-
-            self.mixtral.print_trainable_parameters()
 
         # Freeze the whole model
         else:
@@ -180,6 +178,36 @@ class Vixtral(torch.nn.Module):
 
         return self.optimizer
 
+    def distribute(self, local_rank):
+        self.embed_projector = torch.nn.parallel.DistributedDataParallel(
+            self.embed_projector,
+            device_ids=[local_rank],
+            output_device=local_rank
+        )
+        self.is_distributed = True
+        self.local_rank = local_rank
+
+    def print_parameters(self):
+        """Print the number of parameters in the ViXtral model."""
+
+        if self.is_distributed and self.local_rank != 0:
+            return
+
+        if self.vit is None:
+            print("ViT model is not provided.")
+        else:
+            vit_params = sum(p.numel() for p in self.vit.parameters())
+            vit_trainable_params = sum(p.numel() for p in self.vit.parameters() if p.requires_grad)
+            print(f"ViT trainable params: {vit_trainable_params:,} || all params: {vit_params:,} || trainable/all: {vit_trainable_params / vit_params * 100:.2f}%")
+
+        mixtral_params = sum(p.numel() for p in self.mixtral.parameters())
+        mixtral_trainable_params = sum(p.numel() for p in self.mixtral.parameters() if p.requires_grad)
+        print(f"Mixtral trainable params: {mixtral_trainable_params:,} || all params: {mixtral_params:,} || trainable/all: {mixtral_trainable_params / mixtral_params * 100:.2f}%")
+
+        projector_params = sum(p.numel() for p in self.embed_projector.parameters())
+        projector_trainable_params = sum(p.numel() for p in self.embed_projector.parameters() if p.requires_grad)
+        print(f"Projector trainable params: {projector_trainable_params:,} || all params: {projector_params:,} || trainable/all: {projector_trainable_params / projector_params * 100:.2f}%")
+
     def _prepare_mixtral_input(self, project_embed, labels):
         """Concat project_embeds with labels, prepare input_ids, attentions."""
 
@@ -191,14 +219,6 @@ class Vixtral(torch.nn.Module):
         label_ids = torch.cat((torch.full((project_embed.size()[:-1]), -100, device=self.device), labels), dim=1)
 
         return inputs_embeds, attentions, label_ids
-
-    def distribute(self, local_rank):
-        self.embed_projector = torch.nn.parallel.DistributedDataParallel(
-            self.embed_projector,
-            device_ids=[local_rank],
-            output_device=local_rank
-        )
-        self.is_distributed = True
 
     def forward(
             self,

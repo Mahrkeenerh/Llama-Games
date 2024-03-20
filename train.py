@@ -49,6 +49,7 @@ def load_vixtral(image_size, lora_r, device, local_rank):
 
 def load_data(
     tokenizer,
+    processor,
     image_size,
     image_stack_size,
     max_label_length,
@@ -77,7 +78,7 @@ def load_data(
         train_ds,
         batch_size=minibatch_size,
         shuffle=False,
-        do_prepcocess=True,
+        processor=processor,
         image_size=image_size,
         device=device,
         sampler=sampler
@@ -87,7 +88,7 @@ def load_data(
         val_ds,
         batch_size=minibatch_size,
         shuffle=False,
-        do_prepcocess=True,
+        processor=processor,
         image_size=image_size,
         device=device,
         sampler=sampler
@@ -156,10 +157,13 @@ def main():
         device=device,
         local_rank=local_rank
     )
+    vixtral.print_parameters()
+
     optimizer = vixtral.set_optimizer(torch.optim.Adam, lr=1e-4)
 
     train_loader, val_loader = load_data(
         tokenizer=vixtral.tokenizer,
+        processor=vixtral.vit_processor,
         image_size=image_size,
         image_stack_size=6,
         max_label_length=512,
