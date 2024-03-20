@@ -54,6 +54,7 @@ def load_data(
     max_image_stack_size,
     max_label_length,
     minibatch_size,
+    data_split,
     device,
     seed,
     local_rank
@@ -70,9 +71,18 @@ def load_data(
         seed=seed
     )
 
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=torch.Generator().manual_seed(seed))
+    train_ds, val_ds = torch.utils.data.random_split(
+        dataset,
+        [data_split, 1 - data_split],
+        generator=torch.Generator().manual_seed(seed)
+    )
 
-    sampler = torch.utils.data.distributed.DistributedSampler(train_ds) if local_rank is not None else None
+    if local_rank is not None:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
+    else:
+        train_sampler = None
+        val_sampler = None
 
     train_loader = app_dataset.AppDataLoader(
         train_ds,
@@ -81,7 +91,7 @@ def load_data(
         processor=processor,
         image_size=image_size,
         device=device,
-        sampler=sampler
+        sampler=train_sampler
     )
 
     val_loader = app_dataset.AppDataLoader(
@@ -91,42 +101,75 @@ def load_data(
         processor=processor,
         image_size=image_size,
         device=device,
-        sampler=sampler
+        sampler=val_sampler
     )
 
     return train_loader, val_loader
 
 
-def train(vixtral, optimizer, train_loader, val_loader, epochs, grad_accum_steps, local_rank):
+def train(
+    vixtral,
+    optimizer,
+    scheduler,
+    train_loader, 
+    val_loader,
+    epochs,
+    grad_accum_steps,
+    local_rank
+):
 
-    def get_train_bar(train_loader, epoch, epochs, local_rank):
+    def get_bar_iter(is_train, loader, epoch, epochs, local_rank):
+        text = "Training" if is_train else "Validation"
+        rolling_text = f"Rolling loss: - | " if is_train else ""
         if local_rank is None or local_rank == 0:
-            train_bar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{epochs} - Training, Loss: -"
+            bar = tqdm(
+                loader,
+                desc=f"Epoch {epoch + 1}/{epochs} - {text}, {rolling_text}Loss: -"
             )
         else:
-            train_bar = train_loader
+            bar = loader
 
-        return train_bar
+        return bar
 
-    def set_train_bar_description(train_bar, epoch, epochs, loss, local_rank):
+    def set_bar_description(
+        is_train,
+        bar,
+        epoch,
+        epochs,
+        loss,
+        rolling_loss=None,
+        local_rank=None
+    ):
+        text = "Training" if is_train else "Validation"
+        roll_text = f"Rolling loss: {rolling_loss:.4f} | " if rolling_loss is not None else ""
+
         if local_rank is None or local_rank == 0:
-            train_bar.set_description(
-                f"Epoch {epoch + 1}/{epochs} - Training, Loss: {loss}"
+            bar.set_description(
+                f"Epoch {epoch + 1}/{epochs} - {text}, {roll_text}Loss: {loss:.4f}"
             )
+
+    def get_rolling_loss(rolling_loss, loss):
+        if rolling_loss == 0:
+            rolling_loss = loss.item()
+        else:
+            rolling_loss = rolling_loss * 0.99 + loss.item() * 0.01
+
+        return rolling_loss
+
+    rolling_loss = 0
 
     for epoch in range(epochs):
         optimizer.zero_grad()
         grad_accum_step = 0
 
-        train_bar = get_train_bar(train_loader, epoch, epochs, local_rank)
+        train_bar = get_bar_iter(True, train_loader, epoch, epochs, local_rank)
         for data in train_bar:
             image_batches, labels = data
 
             loss = vixtral(image_batches, labels).loss.mean() / grad_accum_steps
+            rolling_loss = get_rolling_loss(rolling_loss, loss * grad_accum_steps)
 
-            set_train_bar_description(train_bar, epoch, epochs, loss * grad_accum_steps, local_rank)
+            set_bar_description(True, train_bar, epoch, epochs, loss * grad_accum_steps, rolling_loss, local_rank)
 
             loss.backward()
 
@@ -141,9 +184,19 @@ def train(vixtral, optimizer, train_loader, val_loader, epochs, grad_accum_steps
             optimizer.step()
             optimizer.zero_grad()
 
-        # TODO
-        # Do evaluation
-        # Save model
+        scheduler.step()
+
+        with torch.no_grad():
+            val_loss = i = 0
+            val_bar = get_bar_iter(False, val_loader, epoch, epochs, local_rank)
+            for data in val_bar:
+                image_batches, labels = data
+                step_loss = vixtral(image_batches, labels).loss.mean()
+                torch.distributed.reduce(step_loss, 0, op=torch.distributed.ReduceOp.AVG)
+                val_loss += step_loss.item()
+
+                set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
+                i += 1
 
 
 def main():
@@ -159,7 +212,10 @@ def main():
     )
     vixtral.print_parameters()
 
+    epochs = 10
+
     optimizer = vixtral.set_optimizer(torch.optim.Adam, lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     train_loader, val_loader = load_data(
         tokenizer=vixtral.tokenizer,
@@ -168,6 +224,7 @@ def main():
         max_image_stack_size=6,
         max_label_length=512,
         minibatch_size=1,
+        data_split=0.8,
         device=device,
         seed=42,
         local_rank=local_rank
@@ -176,9 +233,10 @@ def main():
     train(
         vixtral,
         optimizer,
+        scheduler,
         train_loader,
         val_loader,
-        epochs=10,
+        epochs=epochs,
         grad_accum_steps=64,
         local_rank=local_rank
     )
