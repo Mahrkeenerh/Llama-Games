@@ -187,16 +187,16 @@ def train(
         scheduler.step()
 
         with torch.no_grad():
-            val_loss = i = 0
+            val_loss = 0
             val_bar = get_bar_iter(False, val_loader, epoch, epochs, local_rank)
-            for data in val_bar:
+            for i, data in enumerate(val_bar):
                 image_batches, labels = data
+
                 step_loss = vixtral(image_batches, labels).loss.mean()
                 torch.distributed.reduce(step_loss, 0, op=torch.distributed.ReduceOp.AVG)
                 val_loss += step_loss.item()
 
                 set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
-                i += 1
 
 
 def main():
@@ -214,7 +214,7 @@ def main():
 
     epochs = 10
 
-    optimizer = vixtral.set_optimizer(torch.optim.Adam, lr=1e-4)
+    optimizer = vixtral.set_optimizer(torch.optim.Adam, lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     train_loader, val_loader = load_data(
