@@ -1,5 +1,6 @@
 import os
 
+from peft import LoraConfig
 import torch
 from tqdm import tqdm
 
@@ -21,7 +22,14 @@ def init():
     return local_rank, device
 
 
-def load_vixtral(image_size, lora_r, device, local_rank):
+def load_vixtral(
+    image_size,
+    lora_r,
+    lora_alpha,
+    lora_dropout,
+    device,
+    local_rank
+):
     vit_load = lambda : modeling.load_VED_vit(
         model_path="/home/xbuban1/ved_model",
         device=device
@@ -31,12 +39,19 @@ def load_vixtral(image_size, lora_r, device, local_rank):
         load_4bit=True,
         device=device
     )
+    lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
 
     vixtral = modeling.Vixtral(
         vit_load_func=vit_load,
         image_size=image_size,
         mixtral_load_func=mixtral_load,
-        lora_r=lora_r,
+        lora=lora_config,
         projector_path=None,
         device=device
     )
@@ -156,7 +171,10 @@ def train(
 
         return rolling_loss
 
+    grad_accum_steps = grad_accum_steps / torch.distributed.get_world_size() if local_rank is not None else grad_accum_steps
     rolling_loss = 0
+
+    vixtral.save_pretrained("vixtral_0", local_rank=local_rank)
 
     for epoch in range(epochs):
         optimizer.zero_grad()
@@ -186,6 +204,8 @@ def train(
 
         scheduler.step()
 
+        vixtral.save_pretrained(f"vixtral_{epoch + 1}", local_rank=local_rank)
+
         with torch.no_grad():
             val_loss = 0
             val_bar = get_bar_iter(False, val_loader, epoch, epochs, local_rank)
@@ -207,6 +227,8 @@ def main():
     vixtral = load_vixtral(
         image_size,
         lora_r=64,
+        lora_alpha=16,
+        lora_dropout=0.05,
         device=device,
         local_rank=local_rank
     )

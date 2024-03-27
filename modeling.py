@@ -1,12 +1,16 @@
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import json
+import os
+from typing import Union
+
+import peft
 import torch
-from transformers import LlamaTokenizerFast, MixtralForCausalLM, BitsAndBytesConfig, VisionEncoderDecoderModel, ViTImageProcessor 
+import transformers
 
 
 def load_VED_vit(model_path, device):
     """Load the ViT model from a VED model."""
 
-    ved_model = VisionEncoderDecoderModel.from_pretrained(
+    ved_model = transformers.VisionEncoderDecoderModel.from_pretrained(
         model_path,
         device_map=device
     )
@@ -15,14 +19,14 @@ def load_VED_vit(model_path, device):
     del ved_model.decoder
     torch.cuda.empty_cache()
 
-    vit_processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+    vit_processor = transformers.ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
     vit_processor.size = {"width": 448, "height": 448}
 
-    return ved_model.encoder, vit_processor
+    return model_path, ved_model.encoder, vit_processor
 
 
 def load_mixtral(model_path, load_4bit, device):
-    tokenizer = LlamaTokenizerFast.from_pretrained(
+    tokenizer = transformers.LlamaTokenizerFast.from_pretrained(
         model_path,
         device_map=device
     )
@@ -31,23 +35,20 @@ def load_mixtral(model_path, load_4bit, device):
     # tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if load_4bit:
-        quantization_config = BitsAndBytesConfig(
+        quantization_config = transformers.BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16
         )
     else:
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.float16
-        )
+        quantization_config = None
 
-    mixtral = MixtralForCausalLM.from_pretrained(
+    mixtral = transformers.MixtralForCausalLM.from_pretrained(
         model_path,
         quantization_config=quantization_config,
         device_map=device
     )
 
-    return mixtral, tokenizer
+    return model_path, mixtral, tokenizer
 
 
 class Vixtral(torch.nn.Module):
@@ -56,31 +57,33 @@ class Vixtral(torch.nn.Module):
             image_size=448,
             vit_load_func=None,
             mixtral_load_func=None,
-            lora_r=64,
+            lora:Union[str, peft.LoraConfig]=None,
             projector_path=None,
             device=None
         ):
         assert device is not None, "Device must be provided."
         super(Vixtral, self).__init__()
 
+        self.image_size = image_size
         self.device = device
         self.is_distributed = False
 
         if vit_load_func is None:
+            self.vit_path = None
             self.vit = None
             self.vit_processor = None
         else:
-            self.vit, self.vit_processor = vit_load_func()
-            self._init_vit(image_size)
+            self.vit_path, self.vit, self.vit_processor = vit_load_func()
+            self._init_vit()
 
         assert mixtral_load_func is not None, "Mixtral model must be provided."
 
-        self.mixtral, self.tokenizer = mixtral_load_func()
-        self._init_mixtral(lora_r)
+        self.mixtral_path, self.mixtral, self.tokenizer = mixtral_load_func()
+        self._init_mixtral(lora)
 
         self._init_embed_projector(projector_path)
 
-    def _init_vit(self, image_size):
+    def _init_vit(self):
         """Apply custom modifications to the ViT model
         - Double input image size
         - Freeze the whole model
@@ -89,14 +92,14 @@ class Vixtral(torch.nn.Module):
         if self.vit is None:
             return
 
-        self.vit.embeddings.patch_embeddings.image_size = [image_size, image_size]
+        self.vit.embeddings.patch_embeddings.image_size = [self.image_size, self.image_size]
 
         # Upscale position embeddings
         old_position_embeddings = self.vit.embeddings.position_embeddings
         first_row = old_position_embeddings[:, 0, :].clone().unsqueeze(0)
         rest_upscaled = torch.nn.functional.interpolate(
             old_position_embeddings[:, 1:, :].clone().unsqueeze(0),
-            size=((image_size // 16) ** 2, self.vit.embeddings.patch_embeddings.projection.out_channels),
+            size=((self.image_size // 16) ** 2, self.vit.embeddings.patch_embeddings.projection.out_channels),
             mode="nearest"
         )[0]
 
@@ -116,29 +119,23 @@ class Vixtral(torch.nn.Module):
 
         self.vit.eval()
 
-    def _init_mixtral(self, lora_r):
+    def _init_mixtral(self, lora):
         """Apply custom modifications to the Mixtral model
-        - Add LoRA
-        - Freeze the rest of the model
+        - Init or load LoRA if provided
         """
 
-        if lora_r > 0:
-            mixtral = prepare_model_for_kbit_training(self.mixtral)
-            loraconfig = LoraConfig(
-                r=lora_r,
-                lora_alpha=16,
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM"
+        if lora is None:
+            self.lora_mixtral = None
+
+        elif isinstance(lora, str):
+            self.lora_mixtral = peft.PeftModel.from_pretrained(
+                self.mixtral,
+                os.path.abspath(lora)
             )
-            self.mixtral = get_peft_model(mixtral, loraconfig)
 
-        # Freeze the whole model
         else:
-            for param in self.mixtral.parameters():
-                param.requires_grad = False
-
-        self.mixtral.eval()
+            mixtral = peft.prepare_model_for_kbit_training(self.mixtral)
+            self.lora_mixtral = peft.get_peft_model(mixtral, lora)
 
     def _init_embed_projector(self, projector_path):
         """Initialize the projector from ViT to Mixtral embeds."""
@@ -153,9 +150,87 @@ class Vixtral(torch.nn.Module):
         )
 
         if projector_path is not None:
-            self.load_projector(projector_path)
+            self._load_projector(projector_path)
 
-    def save_projector(self, path):
+    @classmethod
+    def from_pretrained(
+        self,
+        path,
+        load_4bit=False,
+        device=None
+    ):
+        """Load the ViXtral model from a pretrained model,
+        initialize based on config."""
+
+        device = device or torch.device("cuda")
+
+        with open(os.path.join(path, "vixtral_config.json"), "r") as f:
+            config = json.load(f)
+
+        if config["vit_path"] is None:
+            vit_load_func = None
+        else:
+            vit_load_func = lambda: load_VED_vit(
+                model_path=config["vit_path"],
+                device=device
+            )
+
+        mixtral_load_func = lambda: load_mixtral(
+            model_path=config["mixtral_path"],
+            load_4bit=load_4bit,
+            device=device
+        )
+
+        is_lora = os.path.exists(os.path.join(path, "lora"))
+        lora = os.path.join(path, "lora") if is_lora else None
+
+        vixtral = Vixtral(
+            image_size=config["image_size"],
+            vit_load_func=vit_load_func,
+            mixtral_load_func=mixtral_load_func,
+            lora=lora,
+            projector_path=os.path.join(path, "projector"),
+            device=device
+        )
+
+        return vixtral
+
+    def save_pretrained(self, path, merge_lora=False, local_rank=0):
+        """Save the ViXtral model to a path."""
+
+        if self.is_distributed and local_rank != 0:
+            return
+
+        os.makedirs(path, exist_ok=True)
+
+        with open(os.path.join(path, "vixtral_config.json"), "w") as f:
+            json.dump({
+                "vit_path": self.vit_path,
+                "mixtral_path": self.mixtral_path,
+                "image_size": self.image_size,
+                "lora": not merge_lora
+            }, f, indent=4)
+
+        self._save_projector(os.path.join(path, "projector"))
+
+        if self.lora_mixtral is not None:
+            if merge_lora:
+                self.lora_mixtral.merge_and_unload(os.path.join(path, "mixtral_lora"))
+            else:
+                self.lora_mixtral.save_pretrained(os.path.join(path, "lora"))
+
+    def eval(self):
+        """Set the ViXtral model to evaluation mode."""
+
+        if self.lora_mixtral is not None:
+            self.lora_mixtral.eval()
+        else:
+            self.mixtral.eval()
+
+        for param in self.embed_projector.parameters():
+            param.requires_grad = False
+
+    def _save_projector(self, path):
         if self.is_distributed:
             projector = self.embed_projector.module
         else:
@@ -163,7 +238,7 @@ class Vixtral(torch.nn.Module):
 
         torch.save(projector.state_dict(), path)
 
-    def load_projector(self, path):
+    def _load_projector(self, path):
         if self.is_distributed:
             projector = self.embed_projector.module
         else:
