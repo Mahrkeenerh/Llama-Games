@@ -52,7 +52,7 @@ def load_mixtral(model_path, load_4bit, device):
         device_map=device
     )
 
-    return model_path, mixtral, tokenizer
+    return model_path, mixtral, tokenizer, load_4bit
 
 
 def load_mistral(model_path, load_4bit, device, tokenizer_path=None):
@@ -85,20 +85,20 @@ def load_mistral(model_path, load_4bit, device, tokenizer_path=None):
         device_map=device
     )
 
-    return model_path, mistral, tokenizer
+    return model_path, mistral, tokenizer, load_4bit
 
 
 class Vixtral(torch.nn.Module):
     def __init__(
-            self,
-            image_size=448,
-            image_merge_factor=4,
-            vit_load_func=None,
-            mixtral_load_func=None,
-            lora:Union[str, peft.LoraConfig]=None,
-            projector_path=None,
-            device=None
-        ):
+        self,
+        image_size=448,
+        image_merge_factor=4,
+        vit_load_func=None,
+        mixtral_load_func=None,
+        lora:Union[str, peft.LoraConfig]=None,
+        projector_path=None,
+        device=None
+    ):
         assert device is not None, "Device must be provided."
         assert mixtral_load_func is not None, "Mixtral model must be provided."
         super(Vixtral, self).__init__()
@@ -160,7 +160,7 @@ class Vixtral(torch.nn.Module):
         - Init or load LoRA if provided
         """
 
-        self.mixtral_path, self.mixtral, self.tokenizer = load_func()
+        self.mixtral_path, self.mixtral, self.tokenizer, self.quantized = load_func()
 
         self.bos_embed = self.mixtral.get_input_embeddings()(torch.tensor(self.tokenizer.bos_token_id, device=self.device))
         self.eos_embed = self.mixtral.get_input_embeddings()(torch.tensor(self.tokenizer.eos_token_id, device=self.device))
@@ -384,10 +384,10 @@ class Vixtral(torch.nn.Module):
         return inputs_embeds, attentions, label_ids
 
     def forward(
-            self,
-            image_batches = None,
-            labels = None,
-            encoder_outputs = None
+        self,
+        image_batches = None,
+        labels = None,
+        encoder_outputs = None
     ):
         assert image_batches is not None or encoder_outputs is not None, "Either image_batches or encoder_outputs must be provided."
         assert image_batches is None or encoder_outputs is None, "Only one of image_batches or encoder_outputs can be provided."
@@ -395,7 +395,8 @@ class Vixtral(torch.nn.Module):
         if encoder_outputs is None:
             encoder_outputs = self._prepare_image_encoding(image_batches)
 
-        projected_embed = self.embed_projector(encoder_outputs).type(torch.float16)
+        dtype = torch.float16 if self.quantized else torch.float32
+        projected_embed = self.embed_projector(encoder_outputs).type(dtype)
 
         inputs_embeds, attentions, label_ids = self._prepare_mixtral_input(projected_embed, labels)
 
@@ -406,3 +407,34 @@ class Vixtral(torch.nn.Module):
         )
 
         return mixtral_out
+
+    def generate(
+        self,
+        image_batches=None,
+        encoder_outputs=None,
+        max_new_tokens=512,
+        do_decode=True
+    ):
+        assert image_batches is not None or encoder_outputs is not None, "Either image_batches or encoder_outputs must be provided."
+        assert image_batches is None or encoder_outputs is None, "Only one of image_batches or encoder_outputs can be provided."
+
+        if encoder_outputs is None:
+            encoder_outputs = self._prepare_image_encoding(image_batches)
+
+        dtype = torch.float16 if self.quantized else torch.float32
+        projected_embed = self.embed_projector(encoder_outputs).type(dtype)
+
+        inputs_embeds, attentions, label_ids = self._prepare_mixtral_input(projected_embed, torch.tensor([[]], device=self.device, dtype=torch.long))
+
+        generated_ids = self.mixtral.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attentions,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.tokenizer.pad_token_id
+        )[0]
+
+        if do_decode:
+            out = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return out
+
+        return generated_ids

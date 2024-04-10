@@ -1,3 +1,4 @@
+import json
 import os
 
 from peft import LoraConfig
@@ -16,7 +17,7 @@ def init():
         device = torch.device(local_rank)
         torch.distributed.init_process_group(backend="nccl")
     else:
-        local_rank = 0
+        local_rank = None
         device = torch.device("cuda")
 
     return local_rank, device
@@ -43,7 +44,7 @@ def load_vixtral(
     mixtral_load = lambda : modeling.load_mistral(
         model_path="alpindale/Mistral-7B-v0.2-hf",
         tokenizer_path="mistralai/Mistral-7B-Instruct-v0.2",
-        load_4bit=False,
+        load_4bit=True,
         device=device
     )
     lora_config = LoraConfig(
@@ -129,6 +130,61 @@ def load_data(
     return train_loader, val_loader
 
 
+def init_generation(
+    num_samples,
+    max_new_tokens,
+    local_rank
+):
+    if local_rank is not None and local_rank != 0:
+        return
+
+    os.makedirs("generated/temp", exist_ok=True)
+
+    divider = torch.distributed.get_world_size() if local_rank is not None else 1
+    return num_samples // divider, max_new_tokens
+
+
+@torch.no_grad()
+def sample_generate(
+    vixtral,
+    epoch,
+    data_loader,
+    generation_params,
+    local_rank
+):
+    num_samples, max_new_tokens = generation_params
+    data_iter = iter(data_loader)
+
+    generates = []
+    bar = tqdm(range(num_samples), desc="Generating text descriptions") if local_rank is None or local_rank == 0 else range(num_samples)
+    for _ in bar:
+        image_batches, labels = next(data_iter)
+
+        generated = vixtral.generate(
+            image_batches=image_batches,
+            max_new_tokens=max_new_tokens
+        )
+        generates.append(generated)
+
+    with open(f"generated/temp/{local_rank}.json", "w") as f:
+        json.dump(generates, f)
+
+    if local_rank is not None:
+        torch.distributed.barrier()
+
+    if local_rank == 0 or local_rank is None:
+        all_generates = []
+        for file_name in os.listdir("generated/temp"):
+            with open(f"generated/temp/{file_name}", "r") as f:
+                all_generates.extend(json.load(f))
+
+        with open(f"generated/sample_{epoch}.json", "w") as f:
+            json.dump(all_generates, f)
+
+        for file_name in os.listdir("generated/temp"):
+            os.remove(f"generated/temp/{file_name}")
+
+
 def train(
     vixtral,
     optimizer,
@@ -137,6 +193,7 @@ def train(
     val_loader,
     epochs,
     grad_accum_steps,
+    generation_params,
     local_rank
 ):
 
@@ -181,7 +238,9 @@ def train(
     grad_accum_steps = grad_accum_steps / torch.distributed.get_world_size() if local_rank is not None else grad_accum_steps
     rolling_loss = 0
 
-    vixtral.save_pretrained("vixtral_0", local_rank=local_rank)
+    os.makedirs("models", exist_ok=True)
+    vixtral.save_pretrained("models/vixtral_0", local_rank=local_rank)
+    sample_generate(vixtral, 0, val_loader, generation_params, local_rank)
 
     for epoch in range(epochs):
         optimizer.zero_grad()
@@ -211,8 +270,9 @@ def train(
 
         scheduler.step()
 
-        vixtral.save_pretrained(f"vixtral_{epoch + 1}", local_rank=local_rank)
+        vixtral.save_pretrained(f"models/vixtral_{epoch + 1}", local_rank=local_rank)
 
+        # Validation
         with torch.no_grad():
             val_loss = 0
             val_bar = get_bar_iter(False, val_loader, epoch, epochs, local_rank)
@@ -225,6 +285,7 @@ def train(
 
                 set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
 
+            sample_generate(vixtral, epoch, val_loader, generation_params, local_rank)
 
 def main():
     local_rank, device = init()
@@ -259,6 +320,12 @@ def main():
         local_rank=local_rank
     )
 
+    generation_params = init_generation(
+        num_samples=6,
+        max_new_tokens=512,
+        local_rank=local_rank
+    )
+
     train(
         vixtral,
         optimizer,
@@ -267,6 +334,7 @@ def main():
         val_loader,
         epochs=epochs,
         grad_accum_steps=64,
+        generation_params=generation_params,
         local_rank=local_rank
     )
 
