@@ -75,8 +75,15 @@ class AppDataset(torch.utils.data.Dataset):
             truncation=True,
             max_length=self.max_label_length,
             return_tensors="pt"
-        ).input_ids
-        self.labels[idx] = tokenized[0]
+        ).input_ids[0]
+
+        # Append <eos> token if enough space
+        if tokenized.shape[0] < self.max_label_length:
+            tokenized = torch.cat(
+                (tokenized, torch.tensor([self.tokenizer.eos_token_id]))
+            )
+
+        self.labels[idx] = tokenized
 
     def __len__(self):
         return len(self.image_paths)
@@ -220,6 +227,14 @@ class AppDataLoader(torch.utils.data.DataLoader):
             truncation=True,
             max_length=self.max_label_length,
             return_tensors="pt"
-        )
+        ).input_ids
 
-        return tokenized["input_ids"]
+        # Append <eos> token if enough space
+        if tokenized.shape[1] < self.max_label_length:
+            eos_tokens = torch.full(
+                (tokenized.shape[0], 1),
+                self.tokenizer.eos_token_id
+            )
+            tokenized = torch.cat((tokenized, eos_tokens), dim=1)
+
+        return tokenized

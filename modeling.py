@@ -28,11 +28,12 @@ def load_VED_vit(model_path, image_size, device):
 def load_mixtral(model_path, load_4bit, device):
     tokenizer = transformers.LlamaTokenizerFast.from_pretrained(
         model_path,
+        padding_side="right",
         device_map=device
     )
 
-    # tokenizer.pad_token = tokenizer.eos_token
-    # tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if load_4bit:
         quantization_config = transformers.BitsAndBytesConfig(
@@ -60,8 +61,12 @@ def load_mistral(model_path, load_4bit, device, tokenizer_path=None):
 
     tokenizer = transformers.LlamaTokenizerFast.from_pretrained(
         tokenizer_path,
+        padding_side="right",
         device_map=device
     )
+
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if load_4bit:
         quantization_config = transformers.BitsAndBytesConfig(
@@ -156,6 +161,14 @@ class Vixtral(torch.nn.Module):
         """
 
         self.mixtral_path, self.mixtral, self.tokenizer = load_func()
+
+        self.bos_embed = self.mixtral.get_input_embeddings()(torch.tensor(self.tokenizer.bos_token_id, device=self.device))
+        self.eos_embed = self.mixtral.get_input_embeddings()(torch.tensor(self.tokenizer.eos_token_id, device=self.device))
+
+        self.image_prepend_tokens = self.tokenizer("<img>", return_tensors="pt").input_ids[0][1:].to(self.device)
+        self.image_append_tokens = self.tokenizer("</img>", return_tensors="pt").input_ids[0][1:].to(self.device)
+        self.image_prepend_embeds = self.mixtral.get_input_embeddings()(self.image_prepend_tokens)
+        self.image_append_embeds = self.mixtral.get_input_embeddings()(self.image_append_tokens)
 
         if lora is None:
             self.lora_mixtral = None
@@ -338,11 +351,35 @@ class Vixtral(torch.nn.Module):
         """Concat project_embeds with labels, prepare input_ids, attentions."""
 
         label_embeds = self.mixtral.get_input_embeddings()(labels)
-        inputs_embeds = torch.cat((project_embed, label_embeds), dim=1)
+
+        project_embed_split = torch.split(project_embed, self.image_embed_count, dim=1)
+
+        # build image input: <img> + image + </img>
+        project_embed = torch.cat([
+            torch.cat((
+                self.image_prepend_embeds.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
+                image_embed,
+                self.image_append_embeds.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
+            ), dim=1) for image_embed in project_embed_split
+        ], dim=1)
+
+        # <bos> + images + label
+        inputs_embeds = torch.cat((
+            self.bos_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
+            project_embed,
+            label_embeds
+        ), dim=1)
 
         attentions = torch.ones(inputs_embeds.size()[:-1], device=self.device)
 
-        label_ids = torch.cat((torch.full((project_embed.size()[:-1]), -100, device=self.device), labels), dim=1)
+        label_ids = torch.cat((
+            torch.full(
+                (torch.tensor(project_embed.size()[:-1]) + torch.tensor([0, 1])).tolist(),
+                -100,
+                device=self.device
+            ),
+            labels
+        ), dim=1)
 
         return inputs_embeds, attentions, label_ids
 
