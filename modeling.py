@@ -7,7 +7,7 @@ import torch
 import transformers
 
 
-def load_VED_vit(model_path, device):
+def load_VED_vit(model_path, image_size, device):
     """Load the ViT model from a VED model."""
 
     ved_model = transformers.VisionEncoderDecoderModel.from_pretrained(
@@ -20,7 +20,7 @@ def load_VED_vit(model_path, device):
     torch.cuda.empty_cache()
 
     vit_processor = transformers.ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
-    vit_processor.size = {"width": 448, "height": 448}
+    vit_processor.size = {"width": image_size, "height": image_size}
 
     return model_path, ved_model.encoder, vit_processor
 
@@ -39,22 +39,55 @@ def load_mixtral(model_path, load_4bit, device):
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16
         )
+        attn_implementation = "flash_attention_2"
     else:
         quantization_config = None
+        attn_implementation = None
 
     mixtral = transformers.MixtralForCausalLM.from_pretrained(
         model_path,
         quantization_config=quantization_config,
+        attn_implementation=attn_implementation,
         device_map=device
     )
 
     return model_path, mixtral, tokenizer
 
 
+def load_mistral(model_path, load_4bit, device, tokenizer_path=None):
+    if tokenizer_path is None:
+        tokenizer_path = model_path
+
+    tokenizer = transformers.LlamaTokenizerFast.from_pretrained(
+        tokenizer_path,
+        device_map=device
+    )
+
+    if load_4bit:
+        quantization_config = transformers.BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16
+        )
+        attn_implementation = "flash_attention_2"
+    else:
+        quantization_config = None
+        attn_implementation = None
+
+    mistral = transformers.MistralForCausalLM.from_pretrained(
+        model_path,
+        quantization_config=quantization_config,
+        attn_implementation=attn_implementation,
+        device_map=device
+    )
+
+    return model_path, mistral, tokenizer
+
+
 class Vixtral(torch.nn.Module):
     def __init__(
             self,
             image_size=448,
+            image_merge_factor=4,
             vit_load_func=None,
             mixtral_load_func=None,
             lora:Union[str, peft.LoraConfig]=None,
@@ -62,35 +95,33 @@ class Vixtral(torch.nn.Module):
             device=None
         ):
         assert device is not None, "Device must be provided."
+        assert mixtral_load_func is not None, "Mixtral model must be provided."
         super(Vixtral, self).__init__()
 
         self.image_size = image_size
+        self.image_merge_factor = image_merge_factor
+        self.image_embed_count = image_size ** 2 // 16 ** 2 // image_merge_factor
         self.device = device
         self.is_distributed = False
 
-        if vit_load_func is None:
-            self.vit_path = None
-            self.vit = None
-            self.vit_processor = None
-        else:
-            self.vit_path, self.vit, self.vit_processor = vit_load_func()
-            self._init_vit()
-
-        assert mixtral_load_func is not None, "Mixtral model must be provided."
-
-        self.mixtral_path, self.mixtral, self.tokenizer = mixtral_load_func()
-        self._init_mixtral(lora)
-
+        self._init_vit(vit_load_func)
+        self._init_mixtral(mixtral_load_func, lora)
         self._init_embed_projector(projector_path)
 
-    def _init_vit(self):
+    def _init_vit(self, load_func):
         """Apply custom modifications to the ViT model
         - Double input image size
         - Freeze the whole model
         """
 
-        if self.vit is None:
+        if load_func is None:
+            self.vit_path = None
+            self.vit = None
+            self.vit_processor = None
+
             return
+        else:
+            self.vit_path, self.vit, self.vit_processor = load_func()
 
         self.vit.embeddings.patch_embeddings.image_size = [self.image_size, self.image_size]
 
@@ -119,10 +150,12 @@ class Vixtral(torch.nn.Module):
 
         self.vit.eval()
 
-    def _init_mixtral(self, lora):
+    def _init_mixtral(self, load_func, lora):
         """Apply custom modifications to the Mixtral model
         - Init or load LoRA if provided
         """
+
+        self.mixtral_path, self.mixtral, self.tokenizer = load_func()
 
         if lora is None:
             self.lora_mixtral = None
@@ -144,7 +177,7 @@ class Vixtral(torch.nn.Module):
         word_embed_size = self.mixtral.get_input_embeddings().embedding_dim
 
         self.embed_projector = torch.nn.Linear(
-            image_embed_size * 4,
+            image_embed_size * self.image_merge_factor,
             word_embed_size,
             device=self.device
         )
@@ -275,13 +308,31 @@ class Vixtral(torch.nn.Module):
             vit_trainable_params = sum(p.numel() for p in self.vit.parameters() if p.requires_grad)
             print(f"ViT trainable params: {vit_trainable_params:,} || all params: {vit_params:,} || trainable/all: {vit_trainable_params / vit_params * 100:.2f}%")
 
+        projector_params = sum(p.numel() for p in self.embed_projector.parameters())
+        projector_trainable_params = sum(p.numel() for p in self.embed_projector.parameters() if p.requires_grad)
+        print(f"Projector trainable params: {projector_trainable_params:,} || all params: {projector_params:,} || trainable/all: {projector_trainable_params / projector_params * 100:.2f}%")
+
         mixtral_params = sum(p.numel() for p in self.mixtral.parameters())
         mixtral_trainable_params = sum(p.numel() for p in self.mixtral.parameters() if p.requires_grad)
         print(f"Mixtral trainable params: {mixtral_trainable_params:,} || all params: {mixtral_params:,} || trainable/all: {mixtral_trainable_params / mixtral_params * 100:.2f}%")
 
-        projector_params = sum(p.numel() for p in self.embed_projector.parameters())
-        projector_trainable_params = sum(p.numel() for p in self.embed_projector.parameters() if p.requires_grad)
-        print(f"Projector trainable params: {projector_trainable_params:,} || all params: {projector_params:,} || trainable/all: {projector_trainable_params / projector_params * 100:.2f}%")
+    def _prepare_image_encoding(self, image_batches):
+        """Prepare image encodings from the ViT model."""
+
+        enc_outs = []
+        for image_batch in image_batches:
+            image_embeds = self.vit(image_batch).last_hidden_state
+            image_embeds = image_embeds[:, 1:, :]
+            bs, pn, hs = image_embeds.shape
+            image_embeds = image_embeds.view(
+                bs,
+                int(pn / self.image_merge_factor),
+                int(hs * self.image_merge_factor)
+            )
+
+            enc_outs.append(image_embeds)
+
+        return torch.cat(enc_outs, dim=1)
 
     def _prepare_mixtral_input(self, project_embed, labels):
         """Concat project_embeds with labels, prepare input_ids, attentions."""
@@ -305,16 +356,7 @@ class Vixtral(torch.nn.Module):
         assert image_batches is None or encoder_outputs is None, "Only one of image_batches or encoder_outputs can be provided."
 
         if encoder_outputs is None:
-            enc_outs = []
-            for image_batch in image_batches:
-                image_embeds = self.vit(image_batch).last_hidden_state
-                image_embeds = image_embeds[:, 1:, :]
-                bs, pn, hs = image_embeds.shape
-                image_embeds = image_embeds.view(bs, int(pn / 4), int(hs * 4))
-
-                enc_outs.append(image_embeds)
-
-            encoder_outputs = torch.cat(enc_outs, dim=1)
+            encoder_outputs = self._prepare_image_encoding(image_batches)
 
         projected_embed = self.embed_projector(encoder_outputs).type(torch.float16)
 

@@ -32,11 +32,18 @@ def load_vixtral(
 ):
     vit_load = lambda : modeling.load_VED_vit(
         model_path="/home/xbuban1/ved_model",
+        image_size=image_size,
         device=device
     )
-    mixtral_load = lambda : modeling.load_mixtral(
-        model_path="mistralai/Mixtral-8x7B-v0.1",
-        load_4bit=True,
+    # mixtral_load = lambda : modeling.load_mixtral(
+    #     model_path="mistralai/Mixtral-8x7B-v0.1",
+    #     load_4bit=True,
+    #     device=device
+    # )
+    mixtral_load = lambda : modeling.load_mistral(
+        model_path="alpindale/Mistral-7B-v0.2-hf",
+        tokenizer_path="mistralai/Mistral-7B-Instruct-v0.2",
+        load_4bit=False,
         device=device
     )
     lora_config = LoraConfig(

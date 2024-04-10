@@ -98,7 +98,7 @@ class AppDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         probabilites = self._generate_probabilities(len(self.image_paths[idx]))
         generating_count = min(self.max_image_stack_size, len(self.image_paths[idx]))
-        
+
         # Random sample from image paths based on probabilities
         # Choose maximum max_image_stack_size images
         # If there are less images, return only those
