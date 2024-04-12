@@ -3,31 +3,18 @@ import os
 
 from peft import LoraConfig
 import torch
-from tqdm import tqdm
 
-import app_dataset
 import modeling
-
-
-def init():
-    is_distributed = "LOCAL_RANK" in os.environ
-
-    if is_distributed:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        device = torch.device(local_rank)
-        torch.distributed.init_process_group(backend="nccl")
-    else:
-        local_rank = None
-        device = torch.device("cuda")
-
-    return local_rank, device
+import training
 
 
 def load_vixtral(
     image_size,
+    image_merge_factor,
     lora_r,
     lora_alpha,
     lora_dropout,
+    lora_bias,
     device,
     local_rank
 ):
@@ -36,14 +23,8 @@ def load_vixtral(
         image_size=image_size,
         device=device
     )
-    # mixtral_load = lambda : modeling.load_mixtral(
-    #     model_path="mistralai/Mixtral-8x7B-v0.1",
-    #     load_4bit=True,
-    #     device=device
-    # )
-    mixtral_load = lambda : modeling.load_mistral(
-        model_path="alpindale/Mistral-7B-v0.2-hf",
-        tokenizer_path="mistralai/Mistral-7B-Instruct-v0.2",
+    mixtral_load = lambda : modeling.load_mixtral(
+        model_path="mistralai/Mixtral-8x7B-v0.1",
         load_4bit=True,
         device=device
     )
@@ -51,13 +32,14 @@ def load_vixtral(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        bias="none",
+        bias=lora_bias,
         task_type="CAUSAL_LM"
     )
 
     vixtral = modeling.Vixtral(
         vit_load_func=vit_load,
         image_size=image_size,
+        image_merge_factor=image_merge_factor,
         mixtral_load_func=mixtral_load,
         lora=lora_config,
         projector_path=None,
@@ -70,271 +52,116 @@ def load_vixtral(
     return vixtral
 
 
-def load_data(
-    tokenizer,
-    processor,
-    image_size,
-    max_image_stack_size,
-    max_label_length,
-    minibatch_size,
-    data_split,
-    device,
-    seed,
+def save_config(
+    run_name,
+    vixtral_config,
+    data_config,
+    train_config,
     local_rank
 ):
-    dataset = app_dataset.AppDataset(
-        root="/home/xbuban1/Games",
-        data_name="apps_filtered.json",
-        images_subdir="images",
-        max_image_stack_size=max_image_stack_size,
-        # set tokenizer in dataloader if minibatch size > 1
-        tokenizer=tokenizer,
-        max_label_length=max_label_length,
-        device=device,
-        seed=seed
-    )
-
-    train_ds, val_ds = torch.utils.data.random_split(
-        dataset,
-        [data_split, 1 - data_split],
-        generator=torch.Generator().manual_seed(seed)
-    )
-
-    if local_rank is not None:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = app_dataset.AppDataLoader(
-        train_ds,
-        batch_size=minibatch_size,
-        shuffle=False,
-        processor=processor,
-        image_size=image_size,
-        device=device,
-        sampler=train_sampler
-    )
-
-    val_loader = app_dataset.AppDataLoader(
-        val_ds,
-        batch_size=minibatch_size,
-        shuffle=False,
-        processor=processor,
-        image_size=image_size,
-        device=device,
-        sampler=val_sampler
-    )
-
-    return train_loader, val_loader
-
-
-def init_generation(
-    num_samples,
-    max_new_tokens,
-    local_rank
-):
-    if local_rank is not None and local_rank != 0:
+    if not (local_rank is None or local_rank == 0):
         return
 
-    os.makedirs("generated/temp", exist_ok=True)
+    with open(f"{run_name}/config.json", "w") as f:
+        json.dump({
+            "vixtral": vixtral_config,
+            "data": data_config,
+            "train": train_config
+        }, f, indent=4)
 
-    divider = torch.distributed.get_world_size() if local_rank is not None else 1
-    return num_samples // divider, max_new_tokens
-
-
-@torch.no_grad()
-def sample_generate(
-    vixtral,
-    epoch,
-    data_loader,
-    generation_params,
-    local_rank
-):
-    num_samples, max_new_tokens = generation_params
-    data_iter = iter(data_loader)
-
-    generates = []
-    bar = tqdm(range(num_samples), desc="Generating text descriptions") if local_rank is None or local_rank == 0 else range(num_samples)
-    for _ in bar:
-        image_batches, labels = next(data_iter)
-
-        generated = vixtral.generate(
-            image_batches=image_batches,
-            max_new_tokens=max_new_tokens
-        )
-        generates.append(generated)
-
-    with open(f"generated/temp/{local_rank}.json", "w") as f:
-        json.dump(generates, f)
-
-    if local_rank is not None:
-        torch.distributed.barrier()
-
-    if local_rank == 0 or local_rank is None:
-        all_generates = []
-        for file_name in os.listdir("generated/temp"):
-            with open(f"generated/temp/{file_name}", "r") as f:
-                all_generates.extend(json.load(f))
-
-        with open(f"generated/sample_{epoch}.json", "w") as f:
-            json.dump(all_generates, f)
-
-        for file_name in os.listdir("generated/temp"):
-            os.remove(f"generated/temp/{file_name}")
-
-
-def train(
-    vixtral,
-    optimizer,
-    scheduler,
-    train_loader, 
-    val_loader,
-    epochs,
-    grad_accum_steps,
-    generation_params,
-    local_rank
-):
-
-    def get_bar_iter(is_train, loader, epoch, epochs, local_rank):
-        text = "Training" if is_train else "Validation"
-        rolling_text = f"Rolling loss: - | " if is_train else ""
-        if local_rank is None or local_rank == 0:
-            bar = tqdm(
-                loader,
-                desc=f"Epoch {epoch + 1}/{epochs} - {text}, {rolling_text}Loss: -"
-            )
-        else:
-            bar = loader
-
-        return bar
-
-    def set_bar_description(
-        is_train,
-        bar,
-        epoch,
-        epochs,
-        loss,
-        rolling_loss=None,
-        local_rank=None
-    ):
-        text = "Training" if is_train else "Validation"
-        roll_text = f"Rolling loss: {rolling_loss:.4f} | " if rolling_loss is not None else ""
-
-        if local_rank is None or local_rank == 0:
-            bar.set_description(
-                f"Epoch {epoch + 1}/{epochs} - {text}, {roll_text}Loss: {loss:.4f}"
-            )
-
-    def get_rolling_loss(rolling_loss, loss):
-        if rolling_loss == 0:
-            rolling_loss = loss.item()
-        else:
-            rolling_loss = rolling_loss * 0.99 + loss.item() * 0.01
-
-        return rolling_loss
-
-    grad_accum_steps = grad_accum_steps / torch.distributed.get_world_size() if local_rank is not None else grad_accum_steps
-    rolling_loss = 0
-
-    os.makedirs("models", exist_ok=True)
-    vixtral.save_pretrained("models/vixtral_0", local_rank=local_rank)
-    sample_generate(vixtral, 0, val_loader, generation_params, local_rank)
-
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        grad_accum_step = 0
-
-        train_bar = get_bar_iter(True, train_loader, epoch, epochs, local_rank)
-        for data in train_bar:
-            image_batches, labels = data
-
-            loss = vixtral(image_batches, labels).loss.mean() / grad_accum_steps
-            rolling_loss = get_rolling_loss(rolling_loss, loss * grad_accum_steps)
-
-            set_bar_description(True, train_bar, epoch, epochs, loss * grad_accum_steps, rolling_loss, local_rank)
-
-            loss.backward()
-
-            grad_accum_step += 1
-            if grad_accum_step == grad_accum_steps:
-                grad_accum_step = 0
-                optimizer.step()
-                optimizer.zero_grad()
-
-        # Gradient accumulation for the last batch
-        if grad_accum_step > 0:
-            optimizer.step()
-            optimizer.zero_grad()
-
-        scheduler.step()
-
-        vixtral.save_pretrained(f"models/vixtral_{epoch + 1}", local_rank=local_rank)
-
-        # Validation
-        with torch.no_grad():
-            val_loss = 0
-            val_bar = get_bar_iter(False, val_loader, epoch, epochs, local_rank)
-            for i, data in enumerate(val_bar):
-                image_batches, labels = data
-
-                step_loss = vixtral(image_batches, labels).loss.mean()
-                torch.distributed.reduce(step_loss, 0, op=torch.distributed.ReduceOp.AVG)
-                val_loss += step_loss.item()
-
-                set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
-
-            sample_generate(vixtral, epoch, val_loader, generation_params, local_rank)
 
 def main():
-    local_rank, device = init()
+    local_rank, run_i, device = training.init()
+    run_name = f"runs/Vixtral_{run_i}"
+    os.makedirs(run_name, exist_ok=True)
 
-    image_size = 448
+    vixtral_config = {
+        "image_size": 448,
+        "image_merge_factor": 4,
+        "lora_r": 64,
+        "lora_alpha": 16,
+        "lora_dropout": 0.05,
+        "lora_bias": "none"
+    }
+
+    data_config = {
+        "root": "/home/xbuban1/Games",
+        "data_name": "apps_filtered.json",
+        "image_size": vixtral_config["image_size"],
+        "max_image_stack_size": 6,
+        "max_label_length": 512,
+        "minibatch_size": 1,
+        "data_split": 0.8,
+        "seed": 42
+    }
+
+    train_config = {
+        "epochs": 10,
+        "learning_rate": 1e-4,
+        "grad_accum_steps": 64,
+        "num_samples": 60,
+        "max_new_tokens": 512
+    }
+
+    save_config(
+        run_name,
+        vixtral_config,
+        data_config,
+        train_config,
+        local_rank
+    )
 
     vixtral = load_vixtral(
-        image_size,
-        lora_r=64,
-        lora_alpha=16,
-        lora_dropout=0.05,
+        **vixtral_config,
         device=device,
         local_rank=local_rank
     )
     vixtral.print_parameters()
 
-    epochs = 10
+    if local_rank is None or local_rank == 0:
+        print(f"Training run {run_i}")
+        print('-' * 100)
 
-    optimizer = vixtral.set_optimizer(torch.optim.Adam, lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer = vixtral.set_optimizer(
+        torch.optim.Adam,
+        lr=train_config["learning_rate"]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_config["epochs"])
 
-    train_loader, val_loader = load_data(
+    train_loader, val_loader = training.load_data(
+        **data_config,
         tokenizer=vixtral.tokenizer,
         processor=vixtral.vit_processor,
-        image_size=image_size,
-        max_image_stack_size=6,
-        max_label_length=512,
-        minibatch_size=1,
-        data_split=0.8,
         device=device,
-        seed=42,
         local_rank=local_rank
     )
 
-    generation_params = init_generation(
-        num_samples=6,
-        max_new_tokens=512,
-        local_rank=local_rank
-    )
+    callbacks = [
+        training.GenerateCallback(
+            num_samples=train_config["num_samples"],
+            max_new_tokens=train_config["max_new_tokens"],
+            run_name=run_name,
+            local_rank=local_rank
+        ),
+        training.SaveCallback(
+            run_name=run_name,
+            local_rank=local_rank
+        ),
+        training.LogCallback(
+            run_name=run_name,
+            local_rank=local_rank
+        )
+    ]
 
-    train(
-        vixtral,
-        optimizer,
-        scheduler,
-        train_loader,
-        val_loader,
-        epochs=epochs,
-        grad_accum_steps=64,
-        generation_params=generation_params,
+    training.train(
+        vixtral=vixtral,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=train_config["epochs"],
+        grad_accum_steps=train_config["grad_accum_steps"],
+        callbacks=callbacks,
         local_rank=local_rank
     )
 
