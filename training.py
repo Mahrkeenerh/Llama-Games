@@ -24,10 +24,13 @@ class Callback:
     def train_step(self, **kwargs):
         pass
 
-    def train_epoch(self, **kwargs):
+    def before_train_epoch(self, **kwargs):
         pass
 
-    def val_epoch(self, **kwargs):
+    def after_train_epoch(self, **kwargs):
+        pass
+
+    def after_val_epoch(self, **kwargs):
         pass
 
 
@@ -50,12 +53,17 @@ class Callbacks:
             if not callback.only_main or callback.is_main:
                 callback.train_step(**kwargs)
 
-    def train_epoch(self, **kwargs):
+    def before_train_epoch(self, **kwargs):
+        for callback in self.callbacks:
+            if not callback.only_main or callback.is_main:
+                callback.before_train_epoch(**kwargs)
+
+    def after_train_epoch(self, **kwargs):
         for callback in self.callbacks:
             if not callback.only_main or callback.is_main:
                 callback.train_epoch(**kwargs)
 
-    def val_epoch(self, **kwargs):
+    def after_val_epoch(self, **kwargs):
         for callback in self.callbacks:
             if not callback.only_main or callback.is_main:
                 callback.val_epoch(**kwargs)
@@ -77,12 +85,46 @@ class GenerateCallback(Callback):
         self.local_num_samples = num_samples // divider
         self.max_new_tokens = max_new_tokens
 
+    def save_targets(self, data_loader, sub):
+        temp_dir = os.path.join(self.target_dir, "temp")
+        data_iter = iter(data_loader)
+
+        targets = []
+        for _ in range(self.local_num_samples):
+            image_batches, labels = next(data_iter)
+            targets.append(labels)
+
+        with open(
+            os.path.join(temp_dir, f"{self.local_rank}.json"),
+            "w"
+        ) as f:
+            json.dump(targets, f, indent=4)
+
+        if self.local_rank is not None:
+            torch.distributed.barrier()
+
+        if self.is_main:
+            all_targets = []
+            for file_name in os.listdir(temp_dir):
+                with open(os.path.join(temp_dir, file_name), "r") as f:
+                    all_targets.extend(json.load(f))
+
+            with open(
+                os.path.join(self.target_dir, f"targets_{sub}.json"),
+                "w"
+            ) as f:
+                json.dump(all_targets, f, indent=4)
+
+            for file_name in os.listdir(temp_dir):
+                os.remove(os.path.join(temp_dir, file_name))
+
     @torch.no_grad()
     def sample_generate(
         self,
         vixtral,
         epoch,
-        data_loader
+        data_loader,
+        sub
     ):
         temp_dir = os.path.join(self.target_dir, "temp")
         data_iter = iter(data_loader)
@@ -90,7 +132,7 @@ class GenerateCallback(Callback):
         generates = []
         bar = tqdm(
             range(self.local_num_samples),
-            desc="Generating text descriptions"
+            desc=f"Generating {sub} text descriptions"
         ) if self.is_main is None or self.is_main == 0 else range(self.local_num_samples)
         for _ in bar:
             image_batches, labels = next(data_iter)
@@ -117,7 +159,7 @@ class GenerateCallback(Callback):
                     all_generates.extend(json.load(f))
 
             with open(
-                os.path.join(self.target_dir, f"sample_{epoch}.json"),
+                os.path.join(self.target_dir, f"sample_{epoch}_{sub}.json"),
                 "w"
             ) as f:
                 json.dump(all_generates, f, indent=4)
@@ -126,17 +168,34 @@ class GenerateCallback(Callback):
                 os.remove(os.path.join(temp_dir, file_name))
 
     def start(self, **kwargs):
+        self.save_targets(kwargs["train_loader"], "train")
+        self.save_targets(kwargs["val_loader"], "val")
+
         self.sample_generate(
             vixtral=kwargs["model"],
             epoch=0,
-            data_loader=kwargs["val_loader"]
+            data_loader=kwargs["train_loader"],
+            sub="train"
+        )
+        self.sample_generate(
+            vixtral=kwargs["model"],
+            epoch=0,
+            data_loader=kwargs["val_loader"],
+            sub="val"
         )
 
-    def train_epoch(self, **kwargs):
+    def after_train_epoch(self, **kwargs):
         self.sample_generate(
             vixtral=kwargs["model"],
             epoch=kwargs["epoch"] + 1,
-            data_loader=kwargs["val_loader"]
+            data_loader=kwargs["train_loader"],
+            sub="train"
+        )
+        self.sample_generate(
+            vixtral=kwargs["model"],
+            epoch=kwargs["epoch"] + 1,
+            data_loader=kwargs["val_loader"],
+            sub="val"
         )
 
 
@@ -158,7 +217,7 @@ class SaveCallback(Callback):
             os.path.join(self.target_dir, "vixtral_0")
         )
 
-    def train_epoch(self, **kwargs):
+    def after_train_epoch(self, **kwargs):
         kwargs["model"].save_pretrained(
             os.path.join(self.target_dir, f"vixtral_{kwargs['epoch'] + 1}")
         )
@@ -174,8 +233,8 @@ class LogCallback(Callback):
 
         os.makedirs(self.target_dir, exist_ok=True)
 
-        self.train_losses = [[]]
-        self.rolling_losses = [[]]
+        self.train_losses = []
+        self.rolling_losses = []
         self.val_losses = []
         self.lrs = []
 
@@ -183,9 +242,13 @@ class LogCallback(Callback):
         self.train_losses[-1].append(kwargs["loss"].item())
         self.rolling_losses[-1].append(kwargs["rolling_loss"])
 
-    def val_epoch(self, **kwargs):
-        self.val_losses.append(kwargs["loss"])
+    def before_train_epoch(self, **kwargs):
+        self.train_losses.append([])
+        self.rolling_losses.append([])
         self.lrs.append(kwargs["lr"])
+
+    def after_val_epoch(self, **kwargs):
+        self.val_losses.append(kwargs["loss"])
 
         with open(
             os.path.join(self.target_dir, "loss.json"),
@@ -212,13 +275,7 @@ class LogCallback(Callback):
         plt.title(f"Losses - Epoch {kwargs['epoch'] + 1}")
         plt.savefig(os.path.join(self.target_dir, f"loss_{kwargs['epoch'] + 1}.png"))
 
-        self.train_losses.append([])
-        self.rolling_losses.append([])
-
     def end(self, **kwargs):
-        del self.train_losses[-1]
-        del self.rolling_losses[-1]
-
         with open(
             os.path.join(self.target_dir, "loss.json"),
             "w"
@@ -398,11 +455,19 @@ def train(
     if not isinstance(callbacks, Callbacks):
         callbacks = Callbacks(callbacks)
 
-    callbacks.start(model=vixtral, val_loader=val_loader)
+    callbacks.start(
+        model=vixtral,
+        train_loader=train_loader,
+        val_loader=val_loader
+    )
 
     for epoch in range(epochs):
         optimizer.zero_grad()
         grad_accum_step = 0
+
+        callbacks.before_train_epoch(
+            lr=scheduler.get_last_lr()[0]
+        )
 
         train_bar = get_bar_iter(True, train_loader, epoch, epochs, local_rank)
         for data in train_bar:
@@ -430,9 +495,10 @@ def train(
 
         scheduler.step()
 
-        callbacks.train_epoch(
+        callbacks.after_train_epoch(
             model=vixtral,
             epoch=epoch,
+            train_loader=train_loader,
             val_loader=val_loader
         )
 
@@ -449,10 +515,9 @@ def train(
 
                 set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
 
-            callbacks.val_epoch(
+            callbacks.after_val_epoch(
                 epoch=epoch,
-                loss=val_loss / len(val_loader),
-                lr=scheduler.get_last_lr()[0]
+                loss=val_loss / len(val_loader)
             )
 
     callbacks.end()
