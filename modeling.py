@@ -131,29 +131,30 @@ class Vixtral(torch.nn.Module):
         self.vit.embeddings.patch_embeddings.image_size = [self.image_size, self.image_size]
 
         # Upscale position embeddings
-        old_position_embeddings = self.vit.embeddings.position_embeddings
-        first_row = old_position_embeddings[:, 0, :].clone().unsqueeze(0)
-        rest_upscaled = torch.nn.functional.interpolate(
-            old_position_embeddings[:, 1:, :].clone().unsqueeze(0),
-            size=((self.image_size // 16) ** 2, self.vit.embeddings.patch_embeddings.projection.out_channels),
-            mode="nearest"
-        )[0]
+        if self.image_size != 224:
+            old_position_embeddings = self.vit.embeddings.position_embeddings
+            first_row = old_position_embeddings[:, 0, :].clone().unsqueeze(0)
+            rest_upscaled = torch.nn.functional.interpolate(
+                old_position_embeddings[:, 1:, :].clone().unsqueeze(0),
+                size=((self.image_size // 16) ** 2, self.vit.embeddings.patch_embeddings.projection.out_channels),
+                mode="nearest"
+            )[0]
 
-        new_position_embeddings = torch.nn.Parameter(
-            torch.cat((first_row, rest_upscaled), dim=1),
-            requires_grad=True
-        ).to(self.device)
+            new_position_embeddings = torch.nn.Parameter(
+                torch.cat((first_row, rest_upscaled), dim=1),
+                requires_grad=True
+            ).to(self.device)
 
-        self.vit.embeddings.position_embeddings = new_position_embeddings
+            self.vit.embeddings.position_embeddings = new_position_embeddings
 
         # Disable unused layer
         self.vit.pooler = None
 
-        # Freeze the whole model
-        for param in self.vit.parameters():
-            param.requires_grad = False
+        # # Freeze the whole model
+        # for param in self.vit.parameters():
+        #     param.requires_grad = False
 
-        self.vit.eval()
+        # self.vit.eval()
 
     def _init_mixtral(self, load_func, lora):
         """Apply custom modifications to the Mixtral model
