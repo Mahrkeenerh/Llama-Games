@@ -25,83 +25,55 @@ def load_VED_vit(model_path, image_size, device):
     return model_path, ved_model.encoder, vit_processor
 
 
-def load_mixtral(model_path, load_4bit, device):
-    tokenizer = transformers.LlamaTokenizerFast.from_pretrained(
-        model_path,
-        padding_side="right",
-        device_map=device
-    )
+# https://github.com/unslothai/unsloth/commit/ec19e61c854dcf9104386fa63fc6c4f2944d4f35#diff-4c87be791e40a4afa9f8b04a9169460c5ef851be73de2f006898240cd3a43936R480
+def fix_untrained_tokens(model, eps = 1e-16):
+    """
+    Llama-3 for eg has untrained vectors in the base model.
+    These include <|eot_id|>, <|start_header_id|>, <|end_header_id|>
+    We reset them to the mean of the rest of the tokens
+    """
+    embedding_matrix = model.get_input_embeddings ().weight.data
+    lm_head_matrix   = model.get_output_embeddings().weight.data
 
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Get untrained tokens
+    indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
+    where_untrained = torch.where(indicator_untrained)[0]
+    n_untrained = where_untrained.shape[0]
+    n_trained = embedding_matrix.shape[0] - n_untrained
 
-    if load_4bit:
-        quantization_config = transformers.BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16
-        )
-        attn_implementation = "flash_attention_2"
-    else:
-        quantization_config = None
-        attn_implementation = None
+    # First set untrained to all 0s - sometimes it's not! 1e-23 for bfloat16
+    embedding_matrix[where_untrained] = 0
+    lm_head_matrix  [where_untrained] = 0
 
-    mixtral = transformers.MixtralForCausalLM.from_pretrained(
-        model_path,
-        quantization_config=quantization_config,
-        attn_implementation=attn_implementation,
-        device_map=device
-    )
+    # Find sum
+    sum_embedding  = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
+    sum_lm_head    = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    return model_path, mixtral, tokenizer, load_4bit
+    # Find correct average by dividing by sum of trained tokens
+    mean_embedding = (sum_embedding / n_trained).to(embedding_matrix.dtype)
+    mean_lm_head   = (sum_lm_head   / n_trained).to(lm_head_matrix  .dtype)
 
+    # Set them to the mean
+    embedding_matrix[where_untrained] = mean_embedding
+    lm_head_matrix  [where_untrained] = mean_lm_head
 
-def load_mistral(model_path, load_4bit, device, tokenizer_path=None):
-    if tokenizer_path is None:
-        tokenizer_path = model_path
-
-    tokenizer = transformers.LlamaTokenizerFast.from_pretrained(
-        tokenizer_path,
-        padding_side="right",
-        device_map=device
-    )
-
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    if load_4bit:
-        quantization_config = transformers.BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16
-        )
-        attn_implementation = "flash_attention_2"
-    else:
-        quantization_config = None
-        attn_implementation = None
-
-    mistral = transformers.MistralForCausalLM.from_pretrained(
-        model_path,
-        quantization_config=quantization_config,
-        attn_implementation=attn_implementation,
-        device_map=device
-    )
-
-    return model_path, mistral, tokenizer, load_4bit
+    return mean_embedding, mean_lm_head
 
 
-class Vixtral(torch.nn.Module):
+class LlamaGameDesc(torch.nn.Module):
     def __init__(
         self,
         image_size=448,
         image_merge_factor=4,
         vit_load_func=None,
-        mixtral_load_func=None,
+        llama_id="meta-llama/Meta-Llama-3-8B",
+        tokenizer_id="tokenizer",
         lora:Union[str, peft.LoraConfig]=None,
         projector_path=None,
         device=None
     ):
         assert device is not None, "Device must be provided."
-        assert mixtral_load_func is not None, "Mixtral model must be provided."
-        super(Vixtral, self).__init__()
+        super(LlamaGameDesc, self).__init__()
 
         self.image_size = image_size
         self.image_merge_factor = image_merge_factor
@@ -110,20 +82,18 @@ class Vixtral(torch.nn.Module):
         self.is_distributed = False
 
         self._init_vit(vit_load_func)
-        self._init_mixtral(mixtral_load_func, lora)
+        self._init_llama(llama_id, tokenizer_id, lora)
         self._init_embed_projector(projector_path)
 
     def _init_vit(self, load_func):
         """Apply custom modifications to the ViT model
         - Double input image size
-        - Freeze the whole model
         """
 
         if load_func is None:
             self.vit_path = None
             self.vit = None
             self.vit_processor = None
-
             return
         else:
             self.vit_path, self.vit, self.vit_processor = load_func()
@@ -150,45 +120,56 @@ class Vixtral(torch.nn.Module):
         # Disable unused layer
         self.vit.pooler = None
 
-        # # Freeze the whole model
-        # for param in self.vit.parameters():
-        #     param.requires_grad = False
-
-        # self.vit.eval()
-
-    def _init_mixtral(self, load_func, lora):
-        """Apply custom modifications to the Mixtral model
+    def _init_llama(self, llama_id, tokenizer_id, lora):
+        """Apply custom modifications to the Llama model
         - Init or load LoRA if provided
+        - Add special tokens for image embedding
         """
 
-        self.mixtral_path, self.mixtral, self.tokenizer, self.quantized = load_func()
+        self.is_lora = lora is not None
+        self.llama = transformers.LlamaForCausalLM.from_pretrained(
+            llama_id,
+            device_map=self.device
+        )
+        self.tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(
+            tokenizer_id,
+            padding_side="right"
+        )
 
-        self.bos_embed = self.mixtral.get_input_embeddings()(torch.tensor(self.tokenizer.bos_token_id, device=self.device))
-        self.eos_embed = self.mixtral.get_input_embeddings()(torch.tensor(self.tokenizer.eos_token_id, device=self.device))
+        # Fix untrained tokens
+        fix_untrained_tokens(self.llama)
 
-        self.image_prepend_tokens = self.tokenizer("<img>", return_tensors="pt").input_ids[0][1:].to(self.device)
-        self.image_append_tokens = self.tokenizer("</img>", return_tensors="pt").input_ids[0][1:].to(self.device)
-        self.image_prepend_embeds = self.mixtral.get_input_embeddings()(self.image_prepend_tokens)
-        self.image_append_embeds = self.mixtral.get_input_embeddings()(self.image_append_tokens)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        if lora is None:
-            self.lora_mixtral = None
-
-        elif isinstance(lora, str):
-            self.lora_mixtral = peft.PeftModel.from_pretrained(
-                self.mixtral,
+        if isinstance(lora, str):
+            self.llama = peft.PeftModel.from_pretrained(
+                self.llama,
                 os.path.abspath(lora)
             )
 
         else:
-            mixtral = peft.prepare_model_for_kbit_training(self.mixtral)
-            self.lora_mixtral = peft.get_peft_model(mixtral, lora)
+            llama = peft.prepare_model_for_kbit_training(self.llama)
+            self.llama = peft.get_peft_model(llama, lora)
+
+        llama_embeddings = self.llama.get_input_embeddings()
+
+        self.bos_embed = llama_embeddings(torch.tensor(self.tokenizer.bos_token_id, device=self.device))
+        self.eos_embed = llama_embeddings(torch.tensor(self.tokenizer.eos_token_id, device=self.device))
+
+        self.begin_img_token = self.tokenizer("<|begin_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.end_img_token = self.tokenizer("<|end_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.begin_img_embed = llama_embeddings(self.begin_img_token)
+        self.end_img_embed = llama_embeddings(self.end_img_token)
+
+        self.desc_token = self.tokenizer("<|game_description|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.desc_embed = llama_embeddings(self.desc_token)
 
     def _init_embed_projector(self, projector_path):
-        """Initialize the projector from ViT to Mixtral embeds."""
+        """Initialize the projector from ViT to Llama embeds."""
 
         image_embed_size = self.vit.embeddings.patch_embeddings.projection.out_channels
-        word_embed_size = self.mixtral.get_input_embeddings().embedding_dim
+        word_embed_size = self.llama.get_input_embeddings().embedding_dim
 
         self.embed_projector = torch.nn.Linear(
             image_embed_size * self.image_merge_factor,
@@ -203,15 +184,14 @@ class Vixtral(torch.nn.Module):
     def from_pretrained(
         self,
         path,
-        load_4bit=False,
         device=None
     ):
-        """Load the ViXtral model from a pretrained model,
+        """Load the model from a pretrained model,
         initialize based on config."""
 
         device = device or torch.device("cuda")
 
-        with open(os.path.join(path, "vixtral_config.json"), "r") as f:
+        with open(os.path.join(path, "llama_game_desc_config.json"), "r") as f:
             config = json.load(f)
 
         if config["vit_path"] is None:
@@ -222,59 +202,69 @@ class Vixtral(torch.nn.Module):
                 device=device
             )
 
-        mixtral_load_func = lambda: load_mixtral(
-            model_path=config["mixtral_path"],
-            load_4bit=load_4bit,
-            device=device
-        )
-
-        is_lora = os.path.exists(os.path.join(path, "lora"))
+        is_lora = config["lora"]
         lora = os.path.join(path, "lora") if is_lora else None
 
-        vixtral = Vixtral(
+        llama_id = config["llama_id"]
+        if llama_id == "local_llama":
+            llama_id = os.path.join(path, "llama")
+
+        tokenizer_id = os.path.join(path, "tokenizer")
+
+        model = LlamaGameDesc(
             image_size=config["image_size"],
             vit_load_func=vit_load_func,
-            mixtral_load_func=mixtral_load_func,
+            llama_id=llama_id,
+            tokenizer_id=tokenizer_id,
             lora=lora,
             projector_path=os.path.join(path, "projector"),
             device=device
         )
 
-        return vixtral
+        return model
 
     def save_pretrained(self, path, merge_lora=False, local_rank=0):
-        """Save the ViXtral model to a path."""
+        """Save the model to a specified path."""
 
         if self.is_distributed and local_rank != 0:
             return
 
+        if merge_lora:
+            assert self.is_lora, "Model is not Lora, but merge_lora is True."
+
         os.makedirs(path, exist_ok=True)
 
-        with open(os.path.join(path, "vixtral_config.json"), "w") as f:
+        with open(os.path.join(path, "llama_game_desc_config.json"), "w") as f:
             json.dump({
                 "vit_path": self.vit_path,
-                "mixtral_path": self.mixtral_path,
                 "image_size": self.image_size,
-                "lora": not merge_lora
+                "llama_id": "meta-llama/Meta-Llama-3-8B" if not merge_lora else "local_llama",
+                "lora": self.is_lora and not merge_lora
             }, f, indent=4)
 
         self._save_projector(os.path.join(path, "projector"))
 
-        if self.lora_mixtral is not None:
+        if self.is_lora:
             if merge_lora:
-                self.lora_mixtral.merge_and_unload(os.path.join(path, "mixtral_lora"))
+                self.llama.merge_and_unload(os.path.join(path, "llama"))
             else:
-                self.lora_mixtral.save_pretrained(os.path.join(path, "lora"))
+                self.llama.save_pretrained(os.path.join(path, "lora"))
+
+        self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
 
     def eval(self):
-        """Set the ViXtral model to evaluation mode."""
+        """Set the model to evaluation mode."""
 
-        if self.lora_mixtral is not None:
-            self.lora_mixtral.eval()
-        else:
-            self.mixtral.eval()
+        self.vit.eval()
+        self.llama.eval()
+
+        for param in self.vit.parameters():
+            param.requires_grad = False
 
         for param in self.embed_projector.parameters():
+            param.requires_grad = False
+
+        for param in self.llama.parameters():
             param.requires_grad = False
 
     def _save_projector(self, path):
@@ -294,7 +284,7 @@ class Vixtral(torch.nn.Module):
         projector.load_state_dict(torch.load(path))
 
     def set_optimizer(self, optim, lr):
-        """Set the optimizer for the ViXtral model."""
+        """Set the optimizer for model."""
 
         self.optimizer = optim(self.parameters(), lr=lr)
 
@@ -310,7 +300,7 @@ class Vixtral(torch.nn.Module):
         self.local_rank = local_rank
 
     def print_parameters(self):
-        """Print the number of parameters in the ViXtral model."""
+        """Print the number of parameters in the model."""
 
         if self.is_distributed and self.local_rank != 0:
             return
@@ -326,9 +316,9 @@ class Vixtral(torch.nn.Module):
         projector_trainable_params = sum(p.numel() for p in self.embed_projector.parameters() if p.requires_grad)
         print(f"Projector trainable params: {projector_trainable_params:,} || all params: {projector_params:,} || trainable/all: {projector_trainable_params / projector_params * 100:.2f}%")
 
-        mixtral_params = sum(p.numel() for p in self.mixtral.parameters())
-        mixtral_trainable_params = sum(p.numel() for p in self.mixtral.parameters() if p.requires_grad)
-        print(f"Mixtral trainable params: {mixtral_trainable_params:,} || all params: {mixtral_params:,} || trainable/all: {mixtral_trainable_params / mixtral_params * 100:.2f}%")
+        llama_params = sum(p.numel() for p in self.llama.parameters())
+        llama_trainable_params = sum(p.numel() for p in self.llama.parameters() if p.requires_grad)
+        print(f"Llama trainable params: {llama_trainable_params:,} || all params: {llama_params:,} || trainable/all: {llama_trainable_params / llama_params * 100:.2f}%")
 
     def _prepare_image_encoding(self, image_batches):
         """Prepare image encodings from the ViT model."""
@@ -348,25 +338,25 @@ class Vixtral(torch.nn.Module):
 
         return torch.cat(enc_outs, dim=1)
 
-    def _prepare_mixtral_input(self, project_embed, labels):
+    def _prepare_llama_input(self, project_embed, labels):
         """Concat project_embeds with labels, prepare input_ids, attentions."""
 
-        label_embeds = self.mixtral.get_input_embeddings()(labels)
+        label_embeds = self.llama.get_input_embeddings()(labels)
 
         project_embed_split = torch.split(project_embed, self.image_embed_count, dim=1)
 
-        # build image input: <img> + image + </img>
+        # build image input: <|begin_img|> + image + <|end_img|>
         project_embed = torch.cat([
             torch.cat((
-                self.image_prepend_embeds.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
+                self.begin_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
                 image_embed,
-                self.image_append_embeds.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
+                self.end_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
             ), dim=1) for image_embed in project_embed_split
         ], dim=1)
 
-        # <bos> + images + label
+        # <|game_description|> + images + label
         inputs_embeds = torch.cat((
-            self.bos_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
+            self.desc_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1),
             project_embed,
             label_embeds
         ), dim=1)
@@ -396,18 +386,17 @@ class Vixtral(torch.nn.Module):
         if encoder_outputs is None:
             encoder_outputs = self._prepare_image_encoding(image_batches)
 
-        dtype = torch.float16 if self.quantized else torch.float32
-        projected_embed = self.embed_projector(encoder_outputs).type(dtype)
+        projected_embed = self.embed_projector(encoder_outputs)
 
-        inputs_embeds, attentions, label_ids = self._prepare_mixtral_input(projected_embed, labels)
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(projected_embed, labels)
 
-        mixtral_out = self.mixtral(
+        llama_out = self.llama(
             inputs_embeds=inputs_embeds,
             attention_mask=attentions,
             labels=label_ids
         )
 
-        return mixtral_out
+        return llama_out
 
     def generate(
         self,
@@ -422,12 +411,11 @@ class Vixtral(torch.nn.Module):
         if encoder_outputs is None:
             encoder_outputs = self._prepare_image_encoding(image_batches)
 
-        dtype = torch.float16 if self.quantized else torch.float32
-        projected_embed = self.embed_projector(encoder_outputs).type(dtype)
+        projected_embed = self.embed_projector(encoder_outputs)
 
-        inputs_embeds, attentions, label_ids = self._prepare_mixtral_input(projected_embed, torch.tensor([[]], device=self.device, dtype=torch.long))
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(projected_embed, torch.tensor([[]], device=self.device, dtype=torch.long))
 
-        generated_ids = self.mixtral.generate(
+        generated_ids = self.llama.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attentions,
             max_new_tokens=max_new_tokens,

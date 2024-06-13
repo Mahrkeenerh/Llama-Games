@@ -77,7 +77,7 @@ class AppDataset(torch.utils.data.Dataset):
             return_tensors="pt"
         ).input_ids[0]
 
-        # Append <eos> token if enough space
+        # Append <|end_of_text|> token if enough space
         if tokenized.shape[0] < self.max_label_length:
             tokenized = torch.cat(
                 (tokenized, torch.tensor([self.tokenizer.eos_token_id]))

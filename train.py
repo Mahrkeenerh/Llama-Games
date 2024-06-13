@@ -81,8 +81,8 @@ def main():
         "root": "/home/xbuban1/Games",
         "data_name": "apps_filtered.json",
         "image_size": model_config["image_size"],
-        "max_image_stack_size": 6,
-        "max_label_length": 512,
+        "max_image_stack_size": 10,
+        "max_label_length": 1024,
         "minibatch_size": 1,
         "data_split": 0.8,
         "seed": 42
@@ -94,7 +94,7 @@ def main():
         "grad_accum_steps": 64,
         # "num_samples": 60,
         "num_samples": 2,
-        "max_new_tokens": 512
+        "max_new_tokens": 1024
     }
 
     save_config(
