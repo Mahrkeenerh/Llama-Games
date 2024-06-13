@@ -70,7 +70,7 @@ class Callbacks:
 
 
 class GenerateCallback(Callback):
-    def __init__(self, num_samples, max_new_tokens, **kwargs):
+    def __init__(self, tokenizer, num_samples, max_new_tokens, **kwargs):
         super().__init__(only_main=False, **kwargs)
 
         self.target_dir = "generated"
@@ -82,6 +82,7 @@ class GenerateCallback(Callback):
 
         divider = torch.distributed.get_world_size() if self.local_rank is not None else 1
 
+        self.tokenizer = tokenizer
         self.local_num_samples = num_samples // divider
         self.max_new_tokens = max_new_tokens
 
@@ -92,11 +93,16 @@ class GenerateCallback(Callback):
         targets = []
         for _ in range(self.local_num_samples):
             image_batches, labels = next(data_iter)
-            targets.append(labels)
+            labels = [
+                self.tokenizer.decode(label, skip_special_tokens=True) 
+                for label in labels
+            ]
+            targets.extend(labels)
 
         with open(
             os.path.join(temp_dir, f"{self.local_rank}.json"),
-            "w"
+            "w",
+            encoding="utf-16"
         ) as f:
             json.dump(targets, f, indent=4)
 
@@ -106,12 +112,17 @@ class GenerateCallback(Callback):
         if self.is_main:
             all_targets = []
             for file_name in os.listdir(temp_dir):
-                with open(os.path.join(temp_dir, file_name), "r") as f:
+                with open(
+                    os.path.join(temp_dir, file_name),
+                    "r",
+                    encoding="utf-16"
+                ) as f:
                     all_targets.extend(json.load(f))
 
             with open(
                 os.path.join(self.target_dir, f"targets_{sub}.json"),
-                "w"
+                "w",
+                encoding="utf-16"
             ) as f:
                 json.dump(all_targets, f, indent=4)
 
@@ -121,7 +132,7 @@ class GenerateCallback(Callback):
     @torch.no_grad()
     def sample_generate(
         self,
-        vixtral,
+        model,
         epoch,
         data_loader,
         sub
@@ -133,11 +144,11 @@ class GenerateCallback(Callback):
         bar = tqdm(
             range(self.local_num_samples),
             desc=f"Generating {sub} text descriptions"
-        ) if self.is_main is None or self.is_main == 0 else range(self.local_num_samples)
+        ) if self.is_main else range(self.local_num_samples)
         for _ in bar:
             image_batches, labels = next(data_iter)
 
-            generated = vixtral.generate(
+            generated = model.generate(
                 image_batches=image_batches,
                 max_new_tokens=self.max_new_tokens
             )
@@ -145,7 +156,8 @@ class GenerateCallback(Callback):
 
         with open(
             os.path.join(temp_dir, f"{self.local_rank}.json"),
-            "w"
+            "w",
+            encoding="utf-16"
         ) as f:
             json.dump(generates, f, indent=4)
 
@@ -155,12 +167,17 @@ class GenerateCallback(Callback):
         if self.is_main:
             all_generates = []
             for file_name in os.listdir(temp_dir):
-                with open(os.path.join(temp_dir, file_name), "r") as f:
+                with open(
+                    os.path.join(temp_dir, file_name),
+                    "r",
+                    encoding="utf-16"
+                ) as f:
                     all_generates.extend(json.load(f))
 
             with open(
                 os.path.join(self.target_dir, f"sample_{epoch}_{sub}.json"),
-                "w"
+                "w",
+                encoding="utf-16"
             ) as f:
                 json.dump(all_generates, f, indent=4)
 
@@ -172,13 +189,13 @@ class GenerateCallback(Callback):
         self.save_targets(kwargs["val_loader"], "val")
 
         self.sample_generate(
-            vixtral=kwargs["model"],
+            model=kwargs["model"],
             epoch=0,
             data_loader=kwargs["train_loader"],
             sub="train"
         )
         self.sample_generate(
-            vixtral=kwargs["model"],
+            model=kwargs["model"],
             epoch=0,
             data_loader=kwargs["val_loader"],
             sub="val"
@@ -186,13 +203,13 @@ class GenerateCallback(Callback):
 
     def after_train_epoch(self, **kwargs):
         self.sample_generate(
-            vixtral=kwargs["model"],
+            model=kwargs["model"],
             epoch=kwargs["epoch"] + 1,
             data_loader=kwargs["train_loader"],
             sub="train"
         )
         self.sample_generate(
-            vixtral=kwargs["model"],
+            model=kwargs["model"],
             epoch=kwargs["epoch"] + 1,
             data_loader=kwargs["val_loader"],
             sub="val"
@@ -214,12 +231,12 @@ class SaveCallback(Callback):
 
     def start(self, **kwargs):
         kwargs["model"].save_pretrained(
-            os.path.join(self.target_dir, "vixtral_0")
+            os.path.join(self.target_dir, "model_0")
         )
 
     def after_train_epoch(self, **kwargs):
         kwargs["model"].save_pretrained(
-            os.path.join(self.target_dir, f"vixtral_{kwargs['epoch'] + 1}")
+            os.path.join(self.target_dir, f"model_{kwargs['epoch'] + 1}")
         )
 
 
@@ -322,7 +339,11 @@ class LogCallback(Callback):
 def init():
     is_distributed = "LOCAL_RANK" in os.environ
 
-    run_i = len(os.listdir("runs")) if os.path.exists("runs") else 0
+    run_is = []
+    if os.path.exists("runs"):
+        run_is = [int(run.split("_")[0]) for run in os.listdir("runs")]
+
+    run_i = 0 if len(run_is) == 0 else sorted(run_is)[-1] + 1
 
     if is_distributed:
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -332,7 +353,6 @@ def init():
     else:
         local_rank = None
         device = torch.device("cuda")
-
 
     return local_rank, run_i, device
 
@@ -403,7 +423,7 @@ def load_data(
 
 
 def train(
-    vixtral,
+    model,
     optimizer,
     scheduler,
     train_loader,
@@ -456,7 +476,7 @@ def train(
         callbacks = Callbacks(callbacks)
 
     callbacks.start(
-        model=vixtral,
+        model=model,
         train_loader=train_loader,
         val_loader=val_loader
     )
@@ -473,7 +493,7 @@ def train(
         for data in train_bar:
             image_batches, labels = data
 
-            loss = vixtral(image_batches, labels).loss.mean() / grad_accum_steps
+            loss = model(image_batches, labels).loss.mean() / grad_accum_steps
             rolling_loss = get_rolling_loss(rolling_loss, loss * grad_accum_steps)
 
             set_bar_description(True, train_bar, epoch, epochs, rolling_loss, local_rank)
@@ -496,7 +516,7 @@ def train(
         scheduler.step()
 
         callbacks.after_train_epoch(
-            model=vixtral,
+            model=model,
             epoch=epoch,
             train_loader=train_loader,
             val_loader=val_loader
@@ -509,7 +529,7 @@ def train(
             for i, data in enumerate(val_bar):
                 image_batches, labels = data
 
-                step_loss = vixtral(image_batches, labels).loss.mean()
+                step_loss = model(image_batches, labels).loss.mean()
                 torch.distributed.reduce(step_loss, 0, op=torch.distributed.ReduceOp.AVG)
                 val_loss += step_loss.item()
 

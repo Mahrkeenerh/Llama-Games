@@ -8,7 +8,7 @@ import modeling
 import training
 
 
-def load_vixtral(
+def load_model(
     image_size,
     image_merge_factor,
     lora_r,
@@ -23,11 +23,6 @@ def load_vixtral(
         image_size=image_size,
         device=device
     )
-    mixtral_load = lambda : modeling.load_mixtral(
-        model_path="mistralai/Mixtral-8x7B-v0.1",
-        load_4bit=True,
-        device=device
-    )
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -36,25 +31,23 @@ def load_vixtral(
         task_type="CAUSAL_LM"
     )
 
-    vixtral = modeling.Vixtral(
+    model = modeling.LlamaGameDesc(
         vit_load_func=vit_load,
         image_size=image_size,
         image_merge_factor=image_merge_factor,
-        mixtral_load_func=mixtral_load,
         lora=lora_config,
-        projector_path=None,
         device=device
     )
 
     if local_rank is not None:
-        vixtral.distribute(local_rank)
+        model.distribute(local_rank)
 
-    return vixtral
+    return model
 
 
 def save_config(
     run_name,
-    vixtral_config,
+    model_config,
     data_config,
     train_config,
     local_rank
@@ -64,7 +57,7 @@ def save_config(
 
     with open(f"{run_name}/config.json", "w") as f:
         json.dump({
-            "vixtral": vixtral_config,
+            "model": model_config,
             "data": data_config,
             "train": train_config
         }, f, indent=4)
@@ -72,10 +65,10 @@ def save_config(
 
 def main():
     local_rank, run_i, device = training.init()
-    run_name = f"runs/Vixtral_{run_i}"
+    run_name = f"runs/{run_i}_Llama_Game_Desc"
     os.makedirs(run_name, exist_ok=True)
 
-    vixtral_config = {
+    model_config = {
         "image_size": 448,
         "image_merge_factor": 4,
         "lora_r": 64,
@@ -87,7 +80,7 @@ def main():
     data_config = {
         "root": "/home/xbuban1/Games",
         "data_name": "apps_filtered.json",
-        "image_size": vixtral_config["image_size"],
+        "image_size": model_config["image_size"],
         "max_image_stack_size": 6,
         "max_label_length": 512,
         "minibatch_size": 1,
@@ -99,30 +92,31 @@ def main():
         "epochs": 10,
         "learning_rate": 1e-4,
         "grad_accum_steps": 64,
-        "num_samples": 60,
+        # "num_samples": 60,
+        "num_samples": 2,
         "max_new_tokens": 512
     }
 
     save_config(
         run_name,
-        vixtral_config,
+        model_config,
         data_config,
         train_config,
         local_rank
     )
 
-    vixtral = load_vixtral(
-        **vixtral_config,
+    model = load_model(
+        **model_config,
         device=device,
         local_rank=local_rank
     )
-    vixtral.print_parameters()
+    model.print_parameters()
 
     if local_rank is None or local_rank == 0:
         print(f"Training run {run_i}")
         print('-' * 100)
 
-    optimizer = vixtral.set_optimizer(
+    optimizer = model.set_optimizer(
         torch.optim.Adam,
         lr=train_config["learning_rate"]
     )
@@ -130,14 +124,15 @@ def main():
 
     train_loader, val_loader = training.load_data(
         **data_config,
-        tokenizer=vixtral.tokenizer,
-        processor=vixtral.vit_processor,
+        tokenizer=model.tokenizer,
+        processor=model.vit_processor,
         device=device,
         local_rank=local_rank
     )
 
     callbacks = [
         training.GenerateCallback(
+            tokenizer=model.tokenizer,
             num_samples=train_config["num_samples"],
             max_new_tokens=train_config["max_new_tokens"],
             run_name=run_name,
@@ -154,7 +149,7 @@ def main():
     ]
 
     training.train(
-        vixtral=vixtral,
+        model=model,
         optimizer=optimizer,
         scheduler=scheduler,
         train_loader=train_loader,
