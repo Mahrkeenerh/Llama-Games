@@ -238,3 +238,68 @@ class AppDataLoader(torch.utils.data.DataLoader):
             tokenized = torch.cat((tokenized, eos_tokens), dim=1)
 
         return tokenized
+
+
+def load_data(
+    root,
+    data_name,
+    tokenizer,
+    processor,
+    image_size,
+    max_image_stack_size,
+    max_label_length,
+    minibatch_size,
+    data_split,
+    device,
+    seed,
+    local_rank
+):
+    dataset_tokenizer = tokenizer if minibatch_size == 1 else None
+    dataset = AppDataset(
+        root=root,
+        data_name=data_name,
+        images_subdir="images",
+        max_image_stack_size=max_image_stack_size,
+        tokenizer=dataset_tokenizer,
+        max_label_length=max_label_length,
+        device=device,
+        seed=seed
+    )
+
+    train_ds, val_ds = torch.utils.data.random_split(
+        dataset,
+        [data_split, 1 - data_split],
+        generator=torch.Generator().manual_seed(seed)
+    )
+
+    if local_rank is not None:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
+    else:
+        train_sampler = None
+        val_sampler = None
+
+    dataloader_tokenizer = tokenizer if minibatch_size != 1 else None
+    train_loader = AppDataLoader(
+        train_ds,
+        batch_size=minibatch_size,
+        shuffle=False,
+        processor=processor,
+        tokenizer=dataloader_tokenizer,
+        image_size=image_size,
+        device=device,
+        sampler=train_sampler
+    )
+
+    val_loader = AppDataLoader(
+        val_ds,
+        batch_size=minibatch_size,
+        shuffle=False,
+        processor=processor,
+        tokenizer=dataloader_tokenizer,
+        image_size=image_size,
+        device=device,
+        sampler=val_sampler
+    )
+
+    return train_loader, val_loader

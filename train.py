@@ -31,7 +31,7 @@ def load_model(
         task_type="CAUSAL_LM"
     )
 
-    model = modeling.LlamaGameDesc(
+    model = modeling.LlamaGameDescription(
         vit_load_func=vit_load,
         image_size=image_size,
         image_merge_factor=image_merge_factor,
@@ -116,10 +116,7 @@ def main():
         print(f"Training run {run_i}")
         print('-' * 100)
 
-    optimizer = model.set_optimizer(
-        torch.optim.Adam,
-        lr=train_config["learning_rate"]
-    )
+    optimizer = torch.optim.Adam(lr=train_config["learning_rate"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_config["epochs"])
 
     train_loader, val_loader = training.load_data(
