@@ -3,6 +3,8 @@ import os
 import torch
 from tqdm import tqdm
 
+from .callbacks import Callbacks
+
 
 def init():
     is_distributed = "LOCAL_RANK" in os.environ
@@ -121,8 +123,7 @@ def train(
         callbacks.after_train_epoch(
             model=model,
             epoch=epoch,
-            train_loader=train_loader,
-            val_loader=val_loader
+            train_loader=train_loader
         )
 
         # Validation
@@ -139,7 +140,9 @@ def train(
                 set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
 
             callbacks.after_val_epoch(
+                model=model,
                 epoch=epoch,
+                val_loader=val_loader,
                 loss=val_loss / len(val_loader)
             )
 

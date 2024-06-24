@@ -1,15 +1,15 @@
 import json
 import os
 
-from peft import LoraConfig
 import torch
 
-import modeling
-import training
+from datasets import *
+from modeling import *
+from training import *
 
 
 def load_model(
-    image_size,
+    task,
     image_merge_factor,
     lora_r,
     lora_alpha,
@@ -18,26 +18,27 @@ def load_model(
     device,
     local_rank
 ):
-    vit_load = lambda : modeling.load_VED_vit(
-        model_path="/home/xbuban1/ved_model",
-        image_size=image_size,
-        device=device
-    )
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         bias=lora_bias,
-        task_type="CAUSAL_LM"
+        target_modules=["embed_tokens"],
+        task_type="CAUSAL_LM",
+        # modules_to_save=["embed_tokens"]
     )
 
-    model = modeling.LlamaGameDescription(
-        vit_load_func=vit_load,
-        image_size=image_size,
-        image_merge_factor=image_merge_factor,
-        lora=lora_config,
+    model = LlamaGameDescription(
+        task=task,
+        projector_config=dict(
+            image_merge_factor=image_merge_factor
+        ),
+        lora_config=lora_config,
         device=device
     )
+    model.load_vit("models/vit")
+    model.vit.eval()
+    model.freeze(model.vit)
 
     if local_rank is not None:
         model.distribute(local_rank)
@@ -64,38 +65,54 @@ def save_config(
 
 
 def main():
-    local_rank, run_i, device = training.init()
+    local_rank, run_i, device = init()
     run_name = f"runs/{run_i}_Llama_Game_Desc"
     os.makedirs(run_name, exist_ok=True)
 
-    model_config = {
-        "image_size": 448,
-        "image_merge_factor": 4,
-        "lora_r": 64,
-        "lora_alpha": 16,
-        "lora_dropout": 0.05,
-        "lora_bias": "none"
-    }
+    # model_config = dict(
+    #     image_merge_factor=4,
+    #     lora_r=64,
+    #     lora_alpha=16,
+    #     lora_dropout=0.05,
+    #     lora_bias="none"
+    # )
+    model_config = dict(
+        task="caption",
+        image_merge_factor=4,
+        lora_r=16,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        lora_bias="none"
+    )
 
-    data_config = {
-        "root": "/home/xbuban1/Games",
-        "data_name": "apps_filtered.json",
-        "image_size": model_config["image_size"],
-        "max_image_stack_size": 10,
-        "max_label_length": 1024,
-        "minibatch_size": 1,
-        "data_split": 0.8,
-        "seed": 42
-    }
+    # data_config = {
+    #     "root": "/home/xbuban1/Games",
+    #     "data_name": "apps_filtered.json",
+    #     "image_size": model_config["image_size"],
+    #     "max_image_stack_size": 10,
+    #     "max_label_length": 1024,
+    #     "minibatch_size": 1,
+    #     "data_split": 0.8,
+    #     "seed": 42
+    # }
+    data_config = dict(
+        train_root="/home/xbuban1/coco/images/train2017",
+        train_ann_file="/home/xbuban1/coco/annotations/captions_train2017.json",
+        val_root="/home/xbuban1/coco/images/val2017",
+        val_ann_file="/home/xbuban1/coco/annotations/captions_val2017.json",
+        image_size=448,
+        max_label_length=1024,
+        minibatch_size=16,
+        seed=42
+    )
 
-    train_config = {
-        "epochs": 10,
-        "learning_rate": 1e-4,
-        "grad_accum_steps": 64,
-        # "num_samples": 60,
-        "num_samples": 2,
-        "max_new_tokens": 1024
-    }
+    train_config = dict(
+        epochs=10,
+        learning_rate=1e-4,
+        grad_accum_steps=64 / data_config["minibatch_size"],
+        num_samples=1,
+        max_new_tokens=1024
+    )
 
     save_config(
         run_name,
@@ -116,10 +133,10 @@ def main():
         print(f"Training run {run_i}")
         print('-' * 100)
 
-    optimizer = torch.optim.Adam(lr=train_config["learning_rate"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=train_config["learning_rate"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_config["epochs"])
 
-    train_loader, val_loader = training.load_data(
+    train_loader, val_loader = load_coco_data(
         **data_config,
         tokenizer=model.tokenizer,
         processor=model.vit_processor,
@@ -128,24 +145,24 @@ def main():
     )
 
     callbacks = [
-        training.GenerateCallback(
+        GenerateCallback(
             tokenizer=model.tokenizer,
             num_samples=train_config["num_samples"],
             max_new_tokens=train_config["max_new_tokens"],
             run_name=run_name,
             local_rank=local_rank
         ),
-        training.SaveCallback(
+        SaveCallback(
             run_name=run_name,
             local_rank=local_rank
         ),
-        training.LogCallback(
+        LogCallback(
             run_name=run_name,
             local_rank=local_rank
         )
     ]
 
-    training.train(
+    train(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,

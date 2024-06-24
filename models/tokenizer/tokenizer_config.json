@@ -89,7 +89,7 @@
             "special": true
         },
         "128011": {
-            "content": "<|reserved_special_token_6|>",
+            "content": "<|image_caption|>",
             "lstrip": false,
             "normalized": false,
             "rstrip": false,

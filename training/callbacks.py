@@ -59,12 +59,12 @@ class Callbacks:
     def after_train_epoch(self, **kwargs):
         for callback in self.callbacks:
             if not callback.only_main or callback.is_main:
-                callback.train_epoch(**kwargs)
+                callback.after_train_epoch(**kwargs)
 
     def after_val_epoch(self, **kwargs):
         for callback in self.callbacks:
             if not callback.only_main or callback.is_main:
-                callback.val_epoch(**kwargs)
+                callback.after_val_epoch(**kwargs)
 
 
 class GenerateCallback(Callback):
@@ -206,6 +206,8 @@ class GenerateCallback(Callback):
             data_loader=kwargs["train_loader"],
             sub="train"
         )
+
+    def after_val_epoch(self, **kwargs):
         self.sample_generate(
             model=kwargs["model"],
             epoch=kwargs["epoch"] + 1,
@@ -265,21 +267,6 @@ class LogCallback(Callback):
     def after_val_epoch(self, **kwargs):
         self.val_losses.append(kwargs["loss"])
 
-        with open(
-            os.path.join(self.target_dir, "loss.json"),
-            "w"
-        ) as f:
-            json.dump(
-                {
-                    "train": self.train_losses,
-                    "rolling": self.rolling_losses,
-                    "val": self.val_losses,
-                    "lrs": self.lrs
-                },
-                f,
-                indent=4
-            )
-
         plt.figure(figsize=(10, 5))
         plt.plot([loss for loss in self.train_losses[-1]], label="Train loss")
         plt.plot([loss for loss in self.rolling_losses[-1]], label="Rolling loss")
@@ -289,6 +276,8 @@ class LogCallback(Callback):
         plt.ylabel("Loss")
         plt.title(f"Losses - Epoch {kwargs['epoch'] + 1}")
         plt.savefig(os.path.join(self.target_dir, f"loss_{kwargs['epoch'] + 1}.png"))
+
+        self.end()
 
     def end(self, **kwargs):
         with open(

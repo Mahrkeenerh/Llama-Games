@@ -67,22 +67,35 @@ class Projector(torch.nn.Module):
 class LlamaGameBase(torch.nn.Module):
     def __init__(
         self,
+        projector_config=None,
         device=None
     ):
         super(LlamaGameBase, self).__init__()
 
         self.device = device or torch.device("cuda")
         self.is_distributed = False
+        self.image_embed_count = None
 
+        self.frozen = set()
+        self.vit_dist = None
+        self.projector_dist = None
+        self.llama_dist = None
         self.vit = None
-        self.projector = None
         self.llama = None
+
+        if projector_config is not None:
+            self.projector = Projector(
+                **projector_config,
+                device=self.device
+            )
+        else:
+            self.projector = None
 
     def load_vit(self, path):
         """Load ViT model from a specified path."""
 
         self.vit = ViTModel.from_pretrained(path, device_map=self.device)
-        self.vit_processor = ViTImageProcessor.from_pretrained(path, device=self.device)
+        self.vit_processor = ViTImageProcessor.from_pretrained(path)
 
         self.vit.pooler = None
         torch.cuda.empty_cache()
@@ -98,8 +111,7 @@ class LlamaGameBase(torch.nn.Module):
         if self.is_distributed and self.local_rank != 0:
             return
 
-        vit = self.vit.module if self.is_distributed else self.vit
-        vit.save_pretrained(path)
+        self.vit.save_pretrained(path)
         self.vit_processor.save_pretrained(path)
 
     def _save_projector(self, path):
@@ -108,8 +120,17 @@ class LlamaGameBase(torch.nn.Module):
         if self.is_distributed and self.local_rank != 0:
             return
 
-        projector = self.projector.module if self.is_distributed else self.projector
-        projector.save_pretrained(path)
+        self.projector.save_pretrained(path)
+
+    def _get_image_embed_count(self):
+        if self.image_embed_count is None:
+            if self.projector is None and self.vit is None:
+                print("image_embed_count is None, using default value for image size 448 with merge factor of 4.")
+                self.image_embed_count = 448 ** 2 // 16 ** 2 // 4
+            else:
+                self.image_embed_count = self.vit.config.image_size ** 2 // 16 ** 2 // self.projector.image_merge_factor
+
+        return self.image_embed_count
 
     def print_parameters(self):
         """Print the total number of parameters and trainable parameters in the model."""
@@ -141,22 +162,22 @@ class LlamaGameBase(torch.nn.Module):
     def distribute(self, local_rank):
         """Distribute the model across GPUs."""
 
-        if self.vit is not None:
-            self.vit = torch.nn.parallel.DistributedDataParallel(
+        if self.vit is not None and self.vit not in self.frozen:
+            self.vit_dist = torch.nn.parallel.DistributedDataParallel(
                 self.vit,
                 device_ids=[local_rank],
                 output_device=local_rank
             )
 
-        if self.projector is not None:
-            self.projector = torch.nn.parallel.DistributedDataParallel(
+        if self.projector is not None and self.projector not in self.frozen:
+            self.projector_dist = torch.nn.parallel.DistributedDataParallel(
                 self.projector,
                 device_ids=[local_rank],
                 output_device=local_rank
             )
 
-        if self.llama is not None:
-            self.llama = torch.nn.parallel.DistributedDataParallel(
+        if self.llama is not None and self.llama not in self.frozen:
+            self.llama_dist = torch.nn.parallel.DistributedDataParallel(
                 self.llama,
                 device_ids=[local_rank],
                 output_device=local_rank
@@ -184,6 +205,21 @@ class LlamaGameBase(torch.nn.Module):
         if self.llama is not None:
             self.llama.eval()
 
+    def freeze(self, modules=None):
+        """Freeze specified model modules."""
+
+        if modules is None:
+            modules = [self.vit, self.llama, self.projector]
+
+        if not isinstance(modules, list):
+            modules = [modules]
+
+        for module in modules:
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad = False
+                self.frozen.add(module)
+
     def get_image_encoding(self, image_batches):
         """
         Prepare image encodings from the ViT model.
@@ -191,15 +227,18 @@ class LlamaGameBase(torch.nn.Module):
         Concatenate image_batches to a single tensor.
         """
 
+        image_merge_factor = self.projector.image_merge_factor
+        vit = self.vit if self.vit_dist is None else self.vit_dist
+
         enc_outs = []
         for image_batch in image_batches:
-            image_embeds = self.vit(image_batch).last_hidden_state
+            image_embeds = vit(image_batch).last_hidden_state
             image_embeds = image_embeds[:, 1:, :]
             bs, pn, hs = image_embeds.shape
             image_embeds = image_embeds.view(
                 bs,
-                int(pn / self.projector.image_merge_factor),
-                int(hs * self.projector.image_merge_factor)
+                int(pn / image_merge_factor),
+                int(hs * image_merge_factor)
             )
 
             enc_outs.append(image_embeds)
@@ -219,7 +258,8 @@ class LlamaGameBase(torch.nn.Module):
             if encoder_outputs is None:
                 encoder_outputs = self.get_image_encoding(image_batches)
 
-            projector_outputs = self.projector(encoder_outputs)
+            projector = self.projector if self.projector_dist is None else self.projector_dist
+            projector_outputs = projector(encoder_outputs)
 
         return projector_outputs
 
@@ -231,15 +271,12 @@ class LlamaGameClassification(LlamaGameBase):
         projector_config=None,
         device=None
     ):
-        super(LlamaGameClassification, self).__init__(device=device)
+        super(LlamaGameClassification, self).__init__(
+            projector_config=projector_config,
+            device=device
+        )
 
         self.num_labels = num_labels
-
-        if projector_config is not None:
-            self.projector = Projector(
-                **projector_config,
-                device=self.device
-            )
 
         self.llama = LlamaForSequenceClassification.from_pretrained(
             "meta-llama/Meta-Llama-3-8B",
@@ -260,6 +297,7 @@ class LlamaGameClassification(LlamaGameBase):
             json.dump({
                 "num_labels": self.num_labels
             }, f, indent=4)
+
         torch.save(self.llama.score.state_dict(), os.path.join(path, "model.pt"))
 
     def _load_classificator(self, path):
@@ -324,6 +362,10 @@ class LlamaGameClassification(LlamaGameBase):
         if "llama.score" in load_modules and num_labels is None:
             model._load_classificator(os.path.join(path, "classificator"))
 
+        with open(os.path.join(path, "config.json"), "r") as f:
+            config = json.load(f)
+            model.image_embed_count = config["image_embed_count"]
+
         return model
 
     def save_pretrained(self, path, save_modules=None):
@@ -353,6 +395,11 @@ class LlamaGameClassification(LlamaGameBase):
         if "llama.score" in save_modules:
             self._save_classificator(os.path.join(path, "classificator"))
 
+        with open(os.path.join(path, "config.json"), "w") as f:
+            json.dump({
+                "image_embed_count": self.image_embed_count
+            }, f, indent=4)
+
     def forward(
         self,
         image_batches = None,
@@ -374,11 +421,19 @@ class LlamaGameClassification(LlamaGameBase):
 class LlamaGameDescription(LlamaGameBase):
     def __init__(
         self,
+        task="description", # "description" or "caption"
+        projector_config=None,
         tokenizer_path="models/tokenizer",
         lora_config:LoraConfig=None,
         device=None
     ):
-        super(LlamaGameDescription, self).__init__(device=device)
+        assert task in ["description", "caption"], f"Invalid task: {task}."
+        self.task = task
+
+        super(LlamaGameDescription, self).__init__(
+            projector_config=projector_config,
+            device=device
+        )
 
         self.llama = LlamaForCausalLM.from_pretrained(
             "meta-llama/Meta-Llama-3-8B",
@@ -393,19 +448,7 @@ class LlamaGameDescription(LlamaGameBase):
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self._fix_untrained_tokens()
-
-        llama_embeddings = self.llama.get_input_embeddings()
-
-        self.bos_embed = llama_embeddings(torch.tensor(self.tokenizer.bos_token_id, device=self.device))
-        self.eos_embed = llama_embeddings(torch.tensor(self.tokenizer.eos_token_id, device=self.device))
-
-        self.begin_img_token = self.tokenizer("<|begin_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
-        self.end_img_token = self.tokenizer("<|end_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
-        self.begin_img_embed = llama_embeddings(self.begin_img_token)
-        self.end_img_embed = llama_embeddings(self.end_img_token)
-
-        self.desc_token = self.tokenizer("<|game_description|>", return_tensors="pt").input_ids[0][1].to(self.device)
-        self.desc_embed = llama_embeddings(self.desc_token)
+        self._load_embeds()
 
         if lora_config is not None:
             self.init_lora(lora_config)
@@ -431,8 +474,7 @@ class LlamaGameDescription(LlamaGameBase):
         if self.is_distributed and self.local_rank != 0:
             return
 
-        llama = self.llama.module if self.is_distributed else self.llama
-        llama.save_pretrained(path)
+        self.llama.save_pretrained(path)
 
     # https://github.com/unslothai/unsloth/commit/ec19e61c854dcf9104386fa63fc6c4f2944d4f35#diff-4c87be791e40a4afa9f8b04a9169460c5ef851be73de2f006898240cd3a43936R480
     def _fix_untrained_tokens(self, eps = 1e-16):
@@ -466,10 +508,29 @@ class LlamaGameDescription(LlamaGameBase):
         embedding_matrix[where_untrained] = mean_embedding
         lm_head_matrix  [where_untrained] = mean_lm_head
 
+    def _load_embeds(self):
+        self.llama_embeddings = self.llama.get_input_embeddings()
+
+        self.bos_embed = self.llama_embeddings(torch.tensor(self.tokenizer.bos_token_id, device=self.device))
+        self.eos_embed = self.llama_embeddings(torch.tensor(self.tokenizer.eos_token_id, device=self.device))
+
+        self.begin_img_token = self.tokenizer("<|begin_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.end_img_token = self.tokenizer("<|end_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.begin_img_embed = self.llama_embeddings(self.begin_img_token)
+        self.end_img_embed = self.llama_embeddings(self.end_img_token)
+
+        self.desc_token = self.tokenizer("<|game_description|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.desc_embed = self.llama_embeddings(self.desc_token)
+        self.caption_token = self.tokenizer("<|image_caption|>", return_tensors="pt").input_ids[0][1].to(self.device)
+        self.caption_embed = self.llama_embeddings(self.caption_token)
+
+        self.task_embed = self.desc_embed if self.task == "description" else self.caption_embed
+
     @classmethod
     def from_pretrained(
         self,
         path,
+        task="description",
         load_modules=[],
         device=None
     ) -> Self:
@@ -490,6 +551,7 @@ class LlamaGameDescription(LlamaGameBase):
             assert module in ["vit", "projector", "lora"], f"Invalid module: {module}."
 
         model = LlamaGameDescription(
+            task=task,
             tokenizer_path=os.path.join(path, "tokenizer"),
             device=device
         )
@@ -511,6 +573,10 @@ class LlamaGameDescription(LlamaGameBase):
                 print("LoRA model is not loaded.")
             else:
                 model._load_lora(os.path.join(path, "lora"))
+
+        with open(os.path.join(path, "config.json"), "r") as f:
+            config = json.load(f)
+            model.image_embed_count = config["image_embed_count"]
 
         return model
 
@@ -549,12 +615,16 @@ class LlamaGameDescription(LlamaGameBase):
 
         self.tokenizer.save_pretrained(os.path.join(path, "tokenizer"))
 
+        with open(os.path.join(path, "config.json"), "w") as f:
+            json.dump({
+                "image_embed_count": self.image_embed_count
+            }, f, indent=4)
+
     def _prepare_llama_input(self, project_embed, labels):
         """Concat project_embeds with labels, prepare input_ids, attentions."""
 
-        label_embeds = self.llama.get_input_embeddings()(labels)
-
-        project_embed_split = torch.split(project_embed, self.image_embed_count, dim=1)
+        label_embeds = self.llama_embeddings(labels)
+        project_embed_split = torch.split(project_embed, self._get_image_embed_count(), dim=1)
 
         # build image input: <|begin_img|> + image + <|end_img|>
         project_embed = torch.cat([
@@ -565,10 +635,11 @@ class LlamaGameDescription(LlamaGameBase):
             ), dim=1) for image_embed in project_embed_split
         ], dim=1)
 
-        # <|game_description|> + images + label
+        # <|bos|> + images + <|task|> + label
         inputs_embeds = torch.cat((
-            self.desc_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1),
+            self.bos_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
             project_embed,
+            self.task_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
             label_embeds
         ), dim=1)
 
@@ -576,7 +647,7 @@ class LlamaGameDescription(LlamaGameBase):
 
         label_ids = torch.cat((
             torch.full(
-                (torch.tensor(project_embed.size()[:-1]) + torch.tensor([0, 1])).tolist(),
+                (torch.tensor(project_embed.size()[:-1]) + torch.tensor([0, 2])).tolist(),
                 -100,
                 device=self.device
             ),
@@ -613,7 +684,13 @@ class LlamaGameDescription(LlamaGameBase):
     ):
         projector_outputs = self.get_projector_outputs(image_batches, encoder_outputs, projector_outputs)
 
-        inputs_embeds, attentions, label_ids = self._prepare_llama_input(projector_outputs, torch.tensor([[]], device=self.device, dtype=torch.long))
+        # create empty labels of shape (bs, 0)
+        labels = torch.empty(
+            (projector_outputs.size(0), 0),
+            dtype=torch.long,
+            device=self.device
+        )
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(projector_outputs, labels)
 
         generated = self.llama.generate(
             inputs_embeds=inputs_embeds,
