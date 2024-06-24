@@ -358,10 +358,7 @@ def load_app_data(
 
 
 def load_coco_data(
-    train_root,
-    train_ann_file,
-    val_root,
-    val_ann_file,
+    root,
     tokenizer,
     processor,
     image_size,
@@ -373,16 +370,16 @@ def load_coco_data(
 ):
     dataset_tokenizer = tokenizer if minibatch_size == 1 else None
     train_ds = CocoDataset(
-        root=train_root,
-        ann_file=train_ann_file,
+        root=f"{root}/images/train2017",
+        ann_file=f"{root}/annotations/captions_train2017.json",
         tokenizer=dataset_tokenizer,
         max_label_length=max_label_length,
         device=device,
         seed=seed
     )
     val_ds = CocoDataset(
-        root=val_root,
-        ann_file=val_ann_file,
+        root=f"{root}/images/val2017",
+        ann_file=f"{root}/annotations/captions_val2017.json",
         tokenizer=dataset_tokenizer,
         max_label_length=max_label_length,
         device=device,

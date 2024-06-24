@@ -96,10 +96,7 @@ def main():
     #     "seed": 42
     # }
     data_config = dict(
-        train_root="/home/xbuban1/coco/images/train2017",
-        train_ann_file="/home/xbuban1/coco/annotations/captions_train2017.json",
-        val_root="/home/xbuban1/coco/images/val2017",
-        val_ann_file="/home/xbuban1/coco/annotations/captions_val2017.json",
+        root="/home/xbuban1/coco",
         image_size=448,
         max_label_length=1024,
         minibatch_size=16,
