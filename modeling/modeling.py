@@ -447,8 +447,8 @@ class LlamaGameDescription(LlamaGameBase):
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        self._fix_untrained_tokens()
-        self._load_embeds()
+        self._init_embeds()
+        self._set_embeds()
 
         if lora_config is not None:
             self.init_lora(lora_config)
@@ -476,39 +476,46 @@ class LlamaGameDescription(LlamaGameBase):
 
         self.llama.save_pretrained(path)
 
-    # https://github.com/unslothai/unsloth/commit/ec19e61c854dcf9104386fa63fc6c4f2944d4f35#diff-4c87be791e40a4afa9f8b04a9169460c5ef851be73de2f006898240cd3a43936R480
-    def _fix_untrained_tokens(self, eps = 1e-16):
+    def _init_embeds(self):
         """
-        Llama-3 for eg has untrained vectors in the base model.
-        These include <|eot_id|>, <|start_header_id|>, <|end_header_id|>
-        We reset them to the mean of the rest of the tokens
+        Initialize special tokens embeddings.
+        Utilize smart embedding initialization where possible.
+        Randomly initialize other tokens.
         """
-        embedding_matrix = self.llama.get_input_embeddings ().weight.data
-        lm_head_matrix   = self.llama.get_output_embeddings().weight.data
 
-        # Get untrained tokens
-        indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
-        where_untrained = torch.where(indicator_untrained)[0]
-        n_untrained = where_untrained.shape[0]
-        n_trained = embedding_matrix.shape[0] - n_untrained
+        embedding_matrix = self.llama.get_input_embeddings().weight.data
 
-        # First set untrained to all 0s - sometimes it's not! 1e-23 for bfloat16
-        embedding_matrix[where_untrained] = 0
-        lm_head_matrix  [where_untrained] = 0
+        vocab_map = {
+            "<|image_caption|>": 128011,
+            "<|game_description|>": 128012,
+            "<|begin_img|>": 128013,
+            "<|end_img|>": 128014,
+            "<|begin_of_text|>": 128000,
+            "<|end_of_text|>": 128001,
+            "Image": 1945,
+            "Text": 1199
+        }
 
-        # Find sum
-        sum_embedding  = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
-        sum_lm_head    = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
+        mean_embedding = torch.mean(embedding_matrix, dtype=torch.float32, axis=0)
+        var_embedding  = torch.var(embedding_matrix, dim=0)
 
-        # Find correct average by dividing by sum of trained tokens
-        mean_embedding = (sum_embedding / n_trained).to(embedding_matrix.dtype)
-        mean_lm_head   = (sum_lm_head   / n_trained).to(lm_head_matrix  .dtype)
+        # Randomly initialize untrained tokens with mean var
+        embedding_matrix[vocab_map["<|image_caption|>"]] = mean_embedding + torch.randn_like(mean_embedding) * var_embedding
+        embedding_matrix[vocab_map["<|game_description|>"]] = mean_embedding + torch.randn_like(mean_embedding) * var_embedding
 
-        # Set them to the mean
-        embedding_matrix[where_untrained] = mean_embedding
-        lm_head_matrix  [where_untrained] = mean_lm_head
+        # Utilize smart embedding initialization with algebraic operations
+        embedding_matrix[vocab_map["<|begin_img|>"]] = (
+            embedding_matrix[vocab_map["<|begin_of_text|>"]]
+            - embedding_matrix[vocab_map["Text"]]
+            + embedding_matrix[vocab_map["Image"]]
+        )
+        embedding_matrix[vocab_map["<|end_img|>"]] = (
+            embedding_matrix[vocab_map["<|end_of_text|>"]]
+            - embedding_matrix[vocab_map["Text"]]
+            + embedding_matrix[vocab_map["Image"]]
+        )
 
-    def _load_embeds(self):
+    def _set_embeds(self):
         self.llama_embeddings = self.llama.get_input_embeddings()
 
         self.bos_embed = self.llama_embeddings(torch.tensor(self.tokenizer.bos_token_id, device=self.device))

@@ -84,7 +84,7 @@ class GenerateCallback(Callback):
         self.local_num_samples = num_samples // divider
         self.max_new_tokens = max_new_tokens
 
-    def save_targets(self, data_loader, sub):
+    def save_targets(self, data_loader, epoch, sub):
         temp_dir = os.path.join(self.target_dir, "temp")
         data_iter = iter(data_loader)
 
@@ -118,7 +118,7 @@ class GenerateCallback(Callback):
                     all_targets.extend(json.load(f))
 
             with open(
-                os.path.join(self.target_dir, f"targets_{sub}.json"),
+                os.path.join(self.target_dir, f"targets_{epoch}_{sub}.json"),
                 "w",
                 encoding="utf-16"
             ) as f:
@@ -183,34 +183,37 @@ class GenerateCallback(Callback):
                 os.remove(os.path.join(temp_dir, file_name))
 
     def start(self, **kwargs):
-        self.save_targets(kwargs["train_loader"], "train")
-        self.save_targets(kwargs["val_loader"], "val")
-
-        self.sample_generate(
-            model=kwargs["model"],
-            epoch=0,
-            data_loader=kwargs["train_loader"],
-            sub="train"
-        )
-        self.sample_generate(
-            model=kwargs["model"],
-            epoch=0,
-            data_loader=kwargs["val_loader"],
-            sub="val"
-        )
+        self.after_train_epoch(**kwargs)
+        self.after_val_epoch(**kwargs)
 
     def after_train_epoch(self, **kwargs):
+        e = kwargs.get("epoch", -1) + 1
+
+        self.save_targets(
+            data_loader=kwargs["train_loader"],
+            epoch=e,
+            sub="train"
+        )
+
         self.sample_generate(
             model=kwargs["model"],
-            epoch=kwargs["epoch"] + 1,
+            epoch=e,
             data_loader=kwargs["train_loader"],
             sub="train"
         )
 
     def after_val_epoch(self, **kwargs):
+        e = kwargs.get("epoch", -1) + 1
+
+        self.save_targets(
+            data_loader=kwargs["val_loader"],
+            epoch=e,
+            sub="val"
+        )
+
         self.sample_generate(
             model=kwargs["model"],
-            epoch=kwargs["epoch"] + 1,
+            epoch=e,
             data_loader=kwargs["val_loader"],
             sub="val"
         )

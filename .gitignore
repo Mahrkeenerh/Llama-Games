@@ -1,6 +1,6 @@
 __pycache__
 runs
-llm_venv
 *.bin
 *.safetensors
 *.pt
+test.ipynb

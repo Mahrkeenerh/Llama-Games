@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from datasets import *
+from data import *
 from modeling import *
 from training import *
 
@@ -107,7 +107,7 @@ def main():
         epochs=10,
         learning_rate=1e-4,
         grad_accum_steps=64 / data_config["minibatch_size"],
-        num_samples=1,
+        num_samples=60,
         max_new_tokens=1024
     )
 
