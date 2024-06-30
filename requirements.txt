@@ -1,0 +1,10 @@
+ipykernel==6.29.4
+evaluate==0.4.2
+torch==2.3.1
+torchvision==0.18.1
+transformers==4.42.3
+peft==0.11.1
+nltk==3.8.1
+absl-py==2.1.0
+rouge_score==0.1.2
+pycocotools==2.0.8
