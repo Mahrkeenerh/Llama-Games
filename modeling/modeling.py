@@ -686,8 +686,8 @@ class LlamaGameDescription(LlamaGameBase):
         image_batches=None,
         encoder_outputs=None,
         projector_outputs=None,
-        max_new_tokens=512,
-        do_decode=True
+        do_decode=True,
+        **generation_kwargs
     ):
         projector_outputs = self.get_projector_outputs(image_batches, encoder_outputs, projector_outputs)
 
@@ -702,8 +702,8 @@ class LlamaGameDescription(LlamaGameBase):
         generated = self.llama.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attentions,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.tokenizer.pad_token_id
+            pad_token_id=self.tokenizer.pad_token_id,
+            **generation_kwargs
         )
 
         if do_decode:
