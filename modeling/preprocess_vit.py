@@ -5,7 +5,7 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 
 from datasets import *
-from modeling import *
+from LlamaGames.modeling.llama_games import *
 
 
 def preprocess(t):

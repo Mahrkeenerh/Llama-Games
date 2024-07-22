@@ -45,4 +45,4 @@ def presave_vit(model_id, image_size, out):
 if __name__ == "__main__":
     # Modification of the nlpconnect/vit-gpt2-image-captioning
     # with output_hidden_states enabled
-    presave_vit("/home/xbuban1/Vixtral/models/ved_model", 448, "/home/xbuban1/Vixtral/models/vit")
+    presave_vit("/home/xbuban1/LlamaGames/models/ved_model", 224, "/home/xbuban1/LlamaGames/models/vit_smol")
