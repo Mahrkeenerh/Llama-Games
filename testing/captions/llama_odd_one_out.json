@@ -1,0 +1,152 @@
+[
+    {
+        "index": 0,
+        "parse_issue": false,
+        "correct": false,
+        "response": "4",
+        "insert_index": 1,
+        "captions": [
+            "1. A woman is standing in a living room with a fireplace.",
+            "2. A woman stands in the dining area at the table.",
+            "3. A room with chairs, a table, and a woman in it.",
+            "4. A woman standing in a kitchen by a window",
+            "5. A person standing at a table in a room.",
+            "6. A living area with a television and a table"
+        ]
+    },
+    {
+        "index": 1,
+        "parse_issue": false,
+        "correct": false,
+        "response": "6",
+        "insert_index": 1,
+        "captions": [
+            "1. A brown bear sitting in the grass looking at the camera.",
+            "2. A big burly grizzly bear is show with grass in the background.",
+            "3. The large brown bear has a black nose.",
+            "4. Closeup of a brown bear sitting in a grassy area.",
+            "5. A large bear that is sitting on grass. ",
+            "6. A close up picture of a brown bear's face."
+        ]
+    },
+    {
+        "index": 2,
+        "parse_issue": false,
+        "correct": false,
+        "response": "4",
+        "insert_index": 5,
+        "captions": [
+            "1. Bedroom scene with a bookcase, blue comforter and window.",
+            "2. A bedroom with a bookshelf full of books.",
+            "3. This room has a bed with blue sheets and a large bookcase",
+            "4. A bed and a mirror in a small room.",
+            "5. A bedroom with a bookshelf, a bed, and a window.",
+            "6. a bed room with a neatly made bed a window and a book shelf"
+        ]
+    },
+    {
+        "index": 3,
+        "parse_issue": false,
+        "correct": true,
+        "response": "3",
+        "insert_index": 3,
+        "captions": [
+            "1. A stop sign is mounted upside-down on it's post. ",
+            "2. A stop sign that is hanging upside down.",
+            "3. A stop sign in front of a building.",
+            "4. An upside down stop sign by the road.",
+            "5. a stop sign put upside down on a metal pole ",
+            "6. A stop sign installed upside down on a street corner"
+        ]
+    },
+    {
+        "index": 4,
+        "parse_issue": false,
+        "correct": true,
+        "response": "5",
+        "insert_index": 5,
+        "captions": [
+            "1. Three teddy bears, each a different color, snuggling together.",
+            "2. Three stuffed animals are sitting on a bed. ",
+            "3. three teddy bears giving each other a hug",
+            "4. A group of three stuffed animal teddy bears.",
+            "5. A group of teddy bears sitting on a couch.",
+            "6. Three stuffed bears hugging and sitting on a blue pillow"
+        ]
+    },
+    {
+        "index": 5,
+        "parse_issue": false,
+        "correct": false,
+        "response": "6",
+        "insert_index": 1,
+        "captions": [
+            "1. A woman in a red jacket skiing down a slope.",
+            "2. A woman posing for the camera standing on skis.",
+            "3. a woman standing on skiis while posing for the camera",
+            "4. A woman in a red jacket skiing down a slope",
+            "5. A young woman is skiing down the mountain slope. ",
+            "6. a person on skis makes her way through the snow"
+        ]
+    },
+    {
+        "index": 6,
+        "parse_issue": false,
+        "correct": false,
+        "response": "3",
+        "insert_index": 5,
+        "captions": [
+            "1. A kitchen with a refrigerator, stove and oven with cabinets.",
+            "2. A white oven and a white refrigerator are in the kitchen.",
+            "3. The refrigerator is brand new and was delivered today.",
+            "4. Stark white appliances stand out against brown wooden cabinets.",
+            "5. A kitchen with a refrigerator, stove, and sink.",
+            "6. Kitchen appliances and cabinets as seen through opening."
+        ]
+    },
+    {
+        "index": 7,
+        "parse_issue": false,
+        "correct": true,
+        "response": "2",
+        "insert_index": 2,
+        "captions": [
+            "1. A couple of baseball player standing on a field.",
+            "2. A baseball player running to first base after hitting the ball.",
+            "3. Two men playing baseball in a field on a sunny day.",
+            "4. two baseball players are playing baseball on a field",
+            "5. A couple of men play baseball and the batter runs for base.",
+            "6. Two guys playing baseball, with trees in the back."
+        ]
+    },
+    {
+        "index": 8,
+        "parse_issue": false,
+        "correct": false,
+        "response": "2",
+        "insert_index": 5,
+        "captions": [
+            "1. a male tennis player in white shorts is playing tennis",
+            "2. This woman has just returned a volley in tennis",
+            "3. A man holding a tennis racket playing tennis.",
+            "4. The man balances on one leg after serving a tennis ball.",
+            "5. A man playing tennis on a tennis court.",
+            "6. Someone playing in a tennis tournament with a crowd looking on."
+        ]
+    },
+    {
+        "index": 9,
+        "parse_issue": false,
+        "correct": false,
+        "response": "3",
+        "insert_index": 1,
+        "captions": [
+            "1. A group of children are standing on a tennis court.",
+            "2. The people are posing for a group photo.",
+            "3. a large family poses for picture on tennis court",
+            "4. A group of young children standing next to each other.",
+            "5. A group of people that are standing near a tennis net.",
+            "6. A group of kids posing for a picture on a tennis court."
+        ]
+    }
+]
