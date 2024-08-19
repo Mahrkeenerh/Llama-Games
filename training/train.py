@@ -1,7 +1,12 @@
 import json
 import os
+import sys
 
 import torch
+
+module_path = os.path.abspath(os.path.join('..'))
+if module_path not in sys.path:
+    sys.path.append(module_path)
 
 from data import *
 from modeling import *
@@ -11,6 +16,7 @@ from training import *
 def load_model(
     task,
     image_merge_factor,
+    vit_path,
     lora_r,
     lora_alpha,
     lora_dropout,
@@ -36,7 +42,7 @@ def load_model(
         lora_config=lora_config,
         device=device
     )
-    model.load_vit("models/vit")
+    model.load_vit(vit_path)
     model.vit.eval()
     model.freeze(model.vit)
 
@@ -66,7 +72,7 @@ def save_config(
 
 def main():
     local_rank, run_i, device = init()
-    run_name = f"runs/{run_i}_Llama_Game_Desc"
+    run_name = f"runs/{run_i}_Llama_Captions"
     os.makedirs(run_name, exist_ok=True)
 
     # model_config = dict(
@@ -78,7 +84,8 @@ def main():
     # )
     model_config = dict(
         task="caption",
-        image_merge_factor=4,
+        image_merge_factor=1,
+        vit_path="models/vit",
         lora_r=16,
         lora_alpha=16,
         lora_dropout=0.05,
@@ -99,13 +106,13 @@ def main():
         root="/home/xbuban1/coco",
         image_size=448,
         max_label_length=1024,
-        minibatch_size=16,
+        minibatch_size=4,
         seed=42
     )
 
     train_config = dict(
         epochs=10,
-        learning_rate=1e-4,
+        learning_rate=1e-5,
         grad_accum_steps=64 / data_config["minibatch_size"],
         num_samples=60,
         max_new_tokens=1024

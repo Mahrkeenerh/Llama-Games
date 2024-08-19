@@ -19,8 +19,15 @@ class VEDModel(torch.nn.Module):
     def generate(
         self,
         image,
-        max_new_tokens=128
+        max_new_tokens=128,
+        **generation_kwargs
     ):
         image = self.vit_processor(images=image, return_tensors="pt").to(self.device)
-        outputs = self.ved_model.generate(image.pixel_values, max_new_tokens=max_new_tokens)
+
+        outputs = self.ved_model.generate(
+            image.pixel_values,
+            max_new_tokens=max_new_tokens,
+            **generation_kwargs
+        )
+
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
