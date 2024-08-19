@@ -4,3 +4,4 @@ runs
 *.safetensors
 *.pt
 test.ipynb
+*.env
