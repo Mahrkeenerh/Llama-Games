@@ -279,6 +279,7 @@ class LogCallback(Callback):
         plt.ylabel("Loss")
         plt.title(f"Losses - Epoch {kwargs['epoch'] + 1}")
         plt.savefig(os.path.join(self.target_dir, f"loss_{kwargs['epoch'] + 1}.png"))
+        plt.close()
 
         self.end()
 
@@ -308,6 +309,7 @@ class LogCallback(Callback):
         plt.ylabel("Loss")
         plt.title("Training loss, rolling loss, and validation loss")
         plt.savefig(os.path.join(self.target_dir, "loss.png"))
+        plt.close()
 
         plt.figure(figsize=(10, 5))
         plt.plot(self.val_losses, label="Validation loss")
@@ -316,6 +318,7 @@ class LogCallback(Callback):
         plt.ylabel("Loss")
         plt.title("Validation loss")
         plt.savefig(os.path.join(self.target_dir, "val_loss.png"))
+        plt.close()
 
         plt.figure(figsize=(10, 5))
         plt.plot(self.lrs, label="Learning rate")
@@ -324,3 +327,4 @@ class LogCallback(Callback):
         plt.ylabel("Learning rate")
         plt.title("Learning rate")
         plt.savefig(os.path.join(self.target_dir, "lr.png"))
+        plt.close()

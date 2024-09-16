@@ -134,7 +134,8 @@ def train(
                 image_batches, labels = data
 
                 step_loss = model(image_batches, labels).loss.mean()
-                torch.distributed.reduce(step_loss, 0, op=torch.distributed.ReduceOp.AVG)
+                if local_rank is not None:
+                    torch.distributed.reduce(step_loss, 0, op=torch.distributed.ReduceOp.AVG)
                 val_loss += step_loss.item()
 
                 set_bar_description(False, val_bar, epoch, epochs, val_loss / (i + 1), local_rank=local_rank)
