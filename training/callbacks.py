@@ -91,9 +91,14 @@ class GenerateCallback(Callback):
         targets = []
         for _ in range(self.local_num_samples):
             image_batches, labels = next(data_iter)
+            if len(labels) == 2:
+                hints, descriptions = labels[0], labels[1]
+            else:
+                hints, descriptions = [""] * len(image_batches), labels
+
             labels = [
-                self.tokenizer.decode(label, skip_special_tokens=True) 
-                for label in labels
+                self.tokenizer.decode(hint, skip_special_tokens=True) + self.tokenizer.decode(label, skip_special_tokens=True)
+                for hint, label in zip(hints, descriptions)
             ]
             targets.extend(labels)
 
@@ -148,6 +153,7 @@ class GenerateCallback(Callback):
 
             generated = model.generate(
                 image_batches=image_batches,
+                labels=labels,
                 max_new_tokens=self.max_new_tokens
             )
             generates.append(generated)
