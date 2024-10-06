@@ -5,7 +5,7 @@ from typing import Self
 import peft
 from peft import LoraConfig, PeftModel
 import torch
-from transformers import ViTModel, ViTImageProcessor, LlamaForSequenceClassification, LlamaForCausalLM, PreTrainedTokenizerFast
+from transformers import ViTModel, ViTImageProcessor, LlamaForSequenceClassification, LlamaForCausalLM, PreTrainedTokenizerFast, BitsAndBytesConfig
 
 
 class Projector(torch.nn.Module):
@@ -64,17 +64,18 @@ class Projector(torch.nn.Module):
         return self.projector(image_embeds)
 
 
-class LlamaGameBase(torch.nn.Module):
+class LlamaBase(torch.nn.Module):
     def __init__(
         self,
         projector_config=None,
         device=None
     ):
-        super(LlamaGameBase, self).__init__()
+        super(LlamaBase, self).__init__()
 
         self.device = device or torch.device("cuda")
         self.is_distributed = False
         self.image_embed_count = None
+        self.quantized = False
 
         self.frozen = set()
         self.vit_dist = None
@@ -205,13 +206,13 @@ class LlamaGameBase(torch.nn.Module):
         if self.llama is not None:
             self.llama.eval()
 
-    def freeze(self, modules=None):
+    def freeze(self, *modules):
         """Freeze specified model modules."""
 
         if modules is None:
             modules = [self.vit, self.llama, self.projector]
 
-        if not isinstance(modules, list):
+        if not any([isinstance(modules, list), isinstance(modules, tuple)]):
             modules = [modules]
 
         for module in modules:
@@ -261,10 +262,13 @@ class LlamaGameBase(torch.nn.Module):
             projector = self.projector if self.projector_dist is None else self.projector_dist
             projector_outputs = projector(encoder_outputs)
 
+        if self.quantized:
+            projector_outputs = projector_outputs.to(torch.float16)
+
         return projector_outputs
 
 
-class LlamaGameClassification(LlamaGameBase):
+class LlamaGameClassification(LlamaBase):
     def __init__(
         self,
         num_labels=128,
@@ -279,7 +283,7 @@ class LlamaGameClassification(LlamaGameBase):
         self.num_labels = num_labels
 
         self.llama = LlamaForSequenceClassification.from_pretrained(
-            "meta-llama/Meta-Llama-3-8B",
+            "meta-llama/Meta-Llama-3.1-8B",
             num_labels=self.num_labels,
             device_map=self.device
         )
@@ -418,25 +422,34 @@ class LlamaGameClassification(LlamaGameBase):
         return llama_out
 
 
-class LlamaGameDescription(LlamaGameBase):
+class LlamaCaption(LlamaBase):
     def __init__(
         self,
-        task="description", # "description" or "caption"
         projector_config=None,
         tokenizer_path="models/tokenizer",
+        quantize=False,
         lora_config:LoraConfig=None,
         device=None
     ):
-        assert task in ["description", "caption"], f"Invalid task: {task}."
-        self.task = task
+        self.task = "caption"
 
-        super(LlamaGameDescription, self).__init__(
+        super(LlamaCaption, self).__init__(
             projector_config=projector_config,
             device=device
         )
 
+        self.quantized = quantize
+        if self.quantized:
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+            attn_implementation = "flash_attention_2"
+        else:
+            quant_config = None
+            attn_implementation = None
+
         self.llama = LlamaForCausalLM.from_pretrained(
-            "meta-llama/Meta-Llama-3-8B",
+            "meta-llama/Meta-Llama-3.1-8B",
+            quantization_config=quant_config,
+            attn_implementation=attn_implementation,
             device_map=self.device
         )
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
@@ -447,22 +460,28 @@ class LlamaGameDescription(LlamaGameBase):
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        self._init_embeds()
-        self._set_embeds()
+        self.is_lora = False
 
         if lora_config is not None:
             self.init_lora(lora_config)
 
+        self._init_embeds()
+        self._set_embeds()
+
     def init_lora(self, lora_config):
         """Initialize LoRA model."""
-        self.is_lora = True
 
-        self.llama = peft.prepare_model_for_kbit_training(self.llama)
+        assert not self.is_lora, "Model already has LoRA."
+
+        self.is_lora = True
         self.llama = peft.get_peft_model(self.llama, lora_config)
 
     def _load_lora(self, path):
         """Load LoRA model from a specified path."""
 
+        assert not self.is_lora, "Model already has LoRA."
+
+        self.is_lora = True
         self.llama = PeftModel.from_pretrained(
             self.llama,
             path
@@ -523,21 +542,30 @@ class LlamaGameDescription(LlamaGameBase):
 
         self.begin_img_token = self.tokenizer("<|begin_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
         self.end_img_token = self.tokenizer("<|end_img|>", return_tensors="pt").input_ids[0][1].to(self.device)
-        self.begin_img_embed = self.llama_embeddings(self.begin_img_token)
-        self.end_img_embed = self.llama_embeddings(self.end_img_token)
 
         self.desc_token = self.tokenizer("<|game_description|>", return_tensors="pt").input_ids[0][1].to(self.device)
-        self.desc_embed = self.llama_embeddings(self.desc_token)
         self.caption_token = self.tokenizer("<|image_caption|>", return_tensors="pt").input_ids[0][1].to(self.device)
-        self.caption_embed = self.llama_embeddings(self.caption_token)
 
-        self.task_embed = self.desc_embed if self.task == "description" else self.caption_embed
+    @property
+    def begin_img_embed(self):
+        return self.llama.get_input_embeddings()(self.begin_img_token)
+
+    @property
+    def end_img_embed(self):
+        return self.llama.get_input_embeddings()(self.end_img_token)
+
+    @property
+    def task_embed(self):
+        if self.task == "caption":
+            return self.llama.get_input_embeddings()(self.caption_token)
+        elif self.task == "description":
+            return self.llama.get_input_embeddings()(self.desc_token)
 
     @classmethod
     def from_pretrained(
         self,
         path,
-        task="description",
+        quantize=False,
         load_modules=[],
         device=None
     ) -> Self:
@@ -557,9 +585,9 @@ class LlamaGameDescription(LlamaGameBase):
         for module in load_modules:
             assert module in ["vit", "projector", "lora"], f"Invalid module: {module}."
 
-        model = LlamaGameDescription(
-            task=task,
+        model = LlamaCaption(
             tokenizer_path=os.path.join(path, "tokenizer"),
+            quantize=quantize,
             device=device
         )
 
@@ -601,7 +629,15 @@ class LlamaGameDescription(LlamaGameBase):
         assert save_modules is None or type(save_modules) == list, "save_modules must be None or a list."
 
         if save_modules is None:
-            save_modules = ["vit", "projector", "lora"]
+            save_modules = []
+            if self.vit is not None:
+                save_modules.append("vit")
+
+            if self.projector is not None:
+                save_modules.append("projector")
+
+            if self.is_lora:
+                save_modules.append("lora")
 
         for module in save_modules:
             assert module in ["vit", "projector", "lora"], f"Invalid module: {module}."
@@ -633,20 +669,25 @@ class LlamaGameDescription(LlamaGameBase):
         label_embeds = self.llama_embeddings(labels)
         project_embed_split = torch.split(project_embed, self._get_image_embed_count(), dim=1)
 
+        begin_img_embed = self.begin_img_embed
+        end_img_embed = self.end_img_embed
+
         # build image input: <|begin_img|> + image + <|end_img|>
         project_embed = torch.cat([
             torch.cat((
-                self.begin_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
+                begin_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
                 image_embed,
-                self.end_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
+                end_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
             ), dim=1) for image_embed in project_embed_split
         ], dim=1)
+
+        task_embed = self.task_embed
 
         # <|bos|> + images + <|task|> + label
         inputs_embeds = torch.cat((
             self.bos_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
             project_embed,
-            self.task_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
+            task_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
             label_embeds
         ), dim=1)
 
@@ -698,6 +739,307 @@ class LlamaGameDescription(LlamaGameBase):
             device=self.device
         )
         inputs_embeds, attentions, label_ids = self._prepare_llama_input(projector_outputs, labels)
+
+        generated = self.llama.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attentions,
+            pad_token_id=self.tokenizer.pad_token_id,
+            **generation_kwargs
+        )
+
+        if do_decode:
+            out = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            return out
+
+        return generated
+
+
+class LlamaGameDescription(LlamaCaption):
+    def __init__(
+        self,
+        projector_config=None,
+        tokenizer_path="models/tokenizer",
+        quantize=False,
+        lora_config:LoraConfig=None,
+        device=None
+    ):
+        super(LlamaGameDescription, self).__init__(
+            projector_config=projector_config,
+            tokenizer_path=tokenizer_path,
+            quantize=quantize,
+            lora_config=lora_config,
+            device=device
+        )
+
+        self.task = "description"
+
+        self._init_embeds()
+        self._set_embeds()
+
+    @classmethod
+    def from_pretrained(
+        self,
+        path,
+        quantize=False,
+        load_modules=[],
+        device=None
+    ) -> Self:
+        """
+        Load the model from a pretrained model,
+        initialize based on config.
+
+        load_modules: list of modules to load, if None, load all.
+            possible values: ["vit", "projector", "lora"]
+        """
+
+        device = device or torch.device("cuda")
+
+        if not load_modules:
+            load_modules = ["vit", "projector", "lora"]
+
+        for module in load_modules:
+            assert module in ["vit", "projector", "lora"], f"Invalid module: {module}."
+
+        model = LlamaGameDescription(
+            tokenizer_path=os.path.join(path, "tokenizer"),
+            quantize=quantize,
+            device=device
+        )
+
+        if "vit" in load_modules:
+            if not os.path.exists(os.path.join(path, "vit")):
+                print("ViT model is not loaded.")
+            else:
+                model.load_vit(os.path.join(path, "vit"))
+
+        if "projector" in load_modules:
+            if not os.path.exists(os.path.join(path, "projector")):
+                print("Projector model is not loaded.")
+            else:
+                model.load_projector(os.path.join(path, "projector"))
+
+        if "lora" in load_modules:
+            if not os.path.exists(os.path.join(path, "lora")):
+                print("LoRA model is not loaded.")
+            else:
+                model._load_lora(os.path.join(path, "lora"))
+
+        with open(os.path.join(path, "config.json"), "r") as f:
+            config = json.load(f)
+            model.image_embed_count = config["image_embed_count"]
+
+        return model
+
+    def _prepare_llama_input(self, project_embed, hints, descriptions):
+        """Concat project_embeds with labels, prepare input_ids, attentions."""
+
+        hint_embeds = self.llama_embeddings(hints)
+        description_embeds = self.llama_embeddings(descriptions)
+
+        project_embed_split = torch.split(project_embed, self._get_image_embed_count(), dim=1)
+
+        # build image input: <|begin_img|> + image + <|end_img|>
+        project_embed = torch.cat([
+            torch.cat((
+                self.begin_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
+                image_embed,
+                self.end_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
+            ), dim=1) for image_embed in project_embed_split
+        ], dim=1)
+
+        # <|bos|> + images + <|task|> + hint + description
+        inputs_embeds = torch.cat((
+            self.bos_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
+            project_embed,
+            self.task_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
+            hint_embeds,
+            description_embeds
+        ), dim=1)
+
+        attentions = torch.ones(inputs_embeds.size()[:-1], device=self.device)
+
+        label_ids = torch.cat((
+            torch.full(
+                (torch.tensor(project_embed.size()[:-1]) + torch.tensor([0, 2 + hint_embeds.size()[-2]])).tolist(),
+                -100,
+                device=self.device
+            ),
+            descriptions
+        ), dim=1)
+
+        return inputs_embeds, attentions, label_ids
+
+    def forward(
+        self,
+        image_batches = None,
+        labels=None,
+        encoder_outputs = None,
+        projector_outputs = None
+    ):
+        hints, descriptions = labels
+
+        projector_outputs = self.get_projector_outputs(image_batches, encoder_outputs, projector_outputs)
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(projector_outputs, hints, descriptions)
+
+        llama_out = self.llama(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attentions,
+            labels=label_ids
+        )
+
+        return llama_out
+
+    def generate(
+        self,
+        image_batches=None,
+        hints=None,
+        labels=None,
+        encoder_outputs=None,
+        projector_outputs=None,
+        do_decode=True,
+        **generation_kwargs
+    ):
+        assert hints is not None or labels is not None, "Either hints or labels with hints must be provided."
+
+        projector_outputs = self.get_projector_outputs(image_batches, encoder_outputs, projector_outputs)
+        hints = hints if hints is not None else labels[0]
+
+        # create empty labels of shape (bs, 0)
+        labels = torch.empty(
+            (projector_outputs.size(0), 0),
+            dtype=torch.long,
+            device=self.device
+        )
+
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(projector_outputs, hints, labels)
+
+        generated = self.llama.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attentions,
+            pad_token_id=self.tokenizer.pad_token_id,
+            **generation_kwargs
+        )
+
+        if do_decode:
+            out = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            return out
+
+        return generated
+
+
+class LlamaLora(LlamaCaption):
+    def __init__(
+        self,
+        tokenizer_path="models/tokenizer",
+        quantize=False,
+        lora_config:LoraConfig=None,
+        device=None
+    ):
+        super(LlamaLora, self).__init__(
+            projector_config=None,
+            tokenizer_path=tokenizer_path,
+            quantize=quantize,
+            lora_config=lora_config,
+            device=device
+        )
+
+    @classmethod
+    def from_pretrained(
+        self,
+        path,
+        quantize=False,
+        device=None
+    ) -> Self:
+        """
+        Load the model from a pretrained model,
+        initialize based on config.
+        """
+
+        device = device or torch.device("cuda")
+
+        model = LlamaLora(
+            tokenizer_path=os.path.join(path, "tokenizer"),
+            quantize=quantize,
+            device=device
+        )
+
+        assert os.path.exists(os.path.join(path, "lora")), "LoRA model does not exist."
+
+        model._load_lora(os.path.join(path, "lora"))
+
+        return model
+
+    def save_pretrained(self, path):
+        """
+        Save the model to a specified path.
+        """
+
+        super().save_pretrained(path, save_modules=["lora"])
+
+    def _prepare_llama_input(self, hints, descriptions):
+        """Prepare input_ids, attentions."""
+
+        hint_embeds = self.llama_embeddings(hints)
+        description_embeds = self.llama_embeddings(descriptions)
+
+        # <|bos|> + <|task|> + hint + description
+        inputs_embeds = torch.cat((
+            self.bos_embed.unsqueeze(0).repeat(hint_embeds.size(0), 1, 1).detach(),
+            self.task_embed.unsqueeze(0).repeat(hint_embeds.size(0), 1, 1).detach(),
+            hint_embeds,
+            description_embeds
+        ), dim=1)
+
+        attentions = torch.ones(inputs_embeds.size()[:-1], device=self.device)
+
+        label_ids = torch.cat((
+            torch.full(
+                (torch.tensor(hint_embeds.size()[:-1]) + torch.tensor([0, 2])).tolist(),
+                -100,
+                device=self.device
+            ),
+            descriptions
+        ), dim=1)
+
+        return inputs_embeds, attentions, label_ids
+
+    def forward(
+        self,
+        image_batches = None,
+        labels = None,
+    ):
+        hints, descriptions = labels
+
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(hints, descriptions)
+
+        llama_out = self.llama(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attentions,
+            labels=label_ids
+        )
+
+        return llama_out
+
+    def generate(
+        self,
+        image_batches=None,
+        hints=None,
+        labels=None,
+        do_decode=True,
+        **generation_kwargs
+    ):
+        assert hints is not None or labels is not None, "Either hints or labels with hints must be provided."
+
+        hints = hints if hints is not None else labels[0]
+
+        # create empty labels of shape (bs, 0)
+        labels = torch.empty(
+            (hints.size(0), 0),
+            dtype=torch.long,
+            device=self.device
+        )
+
+        inputs_embeds, attentions, label_ids = self._prepare_llama_input(hints, labels)
 
         generated = self.llama.generate(
             inputs_embeds=inputs_embeds,
