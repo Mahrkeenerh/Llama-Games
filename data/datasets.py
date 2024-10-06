@@ -53,10 +53,12 @@ class AppDataset(DatasetBase):
         max_image_stack_size=8,
         tokenizer=None,
         max_label_length=512,
+        include_hints=False,
         device=None,
         seed=None
     ):
         self.max_image_stack_size = max_image_stack_size
+        self.include_hints = include_hints
 
         super().__init__(
             tokenizer=tokenizer,
@@ -70,7 +72,12 @@ class AppDataset(DatasetBase):
     def _load_datafile(self, root, data_name, images_subdir):
         data_json = json.load(open(os.path.join(root, data_name), "r", encoding="utf-8"))
         dataset_raw = {
-            app["appId"]: {"image_paths": [], "description": app["description"]}
+            app["appId"]: {
+                "image_paths": [],
+                "title": app["title"],
+                "summary": app["summary"],
+                "description": app["description"]
+            }
             for app in data_json
         }
 
@@ -79,21 +86,25 @@ class AppDataset(DatasetBase):
             app_id = "_".join(image.split("_")[:-1])
             if app_id in dataset_raw:
                 dataset_raw[app_id]["image_paths"].append(os.path.join(root, images_subdir, image))
-            else:
-                print("Not found", image)
 
         self.image_paths = []
+        self.hints = []
         self.descriptions = []
 
-        # Extract image paths and descriptions into separate lists
+        # Extract data into separate lists
         for app_id, app in dataset_raw.items():
             if len(app["image_paths"]) > 0:
                 self.image_paths.append(app["image_paths"])
+                if self.include_hints:
+                    self.hints.append(f"Game title: {app['title']}\nShort summary: {app['summary']}\nLong description: ")
+                else:
+                    self.hints.append("")
                 self.descriptions.append(app["description"])
             else:
                 print("No images for", app_id)
 
-        self.labels =  [None] * len(self.descriptions)
+        self.hint_labels = [None] * len(self.hints)
+        self.description_labels =  [None] * len(self.descriptions)
 
     def __len__(self):
         return len(self.image_paths)
@@ -136,11 +147,11 @@ class AppDataset(DatasetBase):
             images.append(image)
 
         # Tokenize label if not already done
-        if self.labels[idx] is None:
-            self.labels[idx] = self._tokenize(self.descriptions[idx])
-        label = self.labels[idx]
+        if self.hint_labels[idx] is None:
+            self.hint_labels[idx] = self._tokenize(self.hints[idx])
+            self.description_labels[idx] = self._tokenize(self.descriptions[idx])
 
-        return images, label
+        return images, [self.hint_labels[idx], self.description_labels[idx]]
 
 
 class CocoDataset(DatasetBase):
@@ -224,19 +235,23 @@ class AppDataLoader(torch.utils.data.DataLoader):
 
     def collate_fn(self, batch):
         images, labels = zip(*list(batch))
+        hints, descriptions = zip(*labels)
 
         if self.processor is not None:
             images = self._image_preprocess(images)
+            images = images.to(self.device)
 
         if self.tokenizer is not None:
-            labels = self._batch_tokenize(labels)
+            hints = self._batch_tokenize(hints)
+            descriptions = self._batch_tokenize(descriptions)
         else:
-            labels = torch.stack(labels, dim=0)
+            hints = torch.stack(hints, dim=0)
+            descriptions = torch.stack(descriptions, dim=0)
 
-        images = images.to(self.device)
-        labels = labels.to(self.device)
+        hints = hints.to(self.device)
+        descriptions = descriptions.to(self.device)
 
-        return images, labels
+        return images, [hints, descriptions]
 
     def _image_preprocess(self, images):
         """Preprocess images using the processor.
@@ -302,6 +317,7 @@ def load_app_data(
     max_label_length,
     minibatch_size,
     data_split,
+    include_hints,
     device,
     seed,
     local_rank=None
@@ -314,6 +330,7 @@ def load_app_data(
         max_image_stack_size=max_image_stack_size,
         tokenizer=dataset_tokenizer,
         max_label_length=max_label_length,
+        include_hints=include_hints,
         device=device,
         seed=seed
     )
