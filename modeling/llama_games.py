@@ -838,20 +838,25 @@ class LlamaGameDescription(LlamaCaption):
 
         project_embed_split = torch.split(project_embed, self._get_image_embed_count(), dim=1)
 
+        begin_img_embed = self.begin_img_embed
+        end_img_embed = self.end_img_embed
+
         # build image input: <|begin_img|> + image + <|end_img|>
         project_embed = torch.cat([
             torch.cat((
-                self.begin_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
+                begin_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach(),
                 image_embed,
-                self.end_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
+                end_img_embed.unsqueeze(0).repeat(image_embed.shape[0], 1, 1).detach()
             ), dim=1) for image_embed in project_embed_split
         ], dim=1)
+
+        task_embed = self.task_embed
 
         # <|bos|> + images + <|task|> + hint + description
         inputs_embeds = torch.cat((
             self.bos_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
             project_embed,
-            self.task_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
+            task_embed.unsqueeze(0).repeat(project_embed.size(0), 1, 1).detach(),
             hint_embeds,
             description_embeds
         ), dim=1)
@@ -982,10 +987,12 @@ class LlamaLora(LlamaCaption):
         hint_embeds = self.llama_embeddings(hints)
         description_embeds = self.llama_embeddings(descriptions)
 
+        task_embed = self.task_embed
+
         # <|bos|> + <|task|> + hint + description
         inputs_embeds = torch.cat((
             self.bos_embed.unsqueeze(0).repeat(hint_embeds.size(0), 1, 1).detach(),
-            self.task_embed.unsqueeze(0).repeat(hint_embeds.size(0), 1, 1).detach(),
+            task_embed.unsqueeze(0).repeat(hint_embeds.size(0), 1, 1).detach(),
             hint_embeds,
             description_embeds
         ), dim=1)
