@@ -1,6 +1,7 @@
 import json
 
 import evaluate
+from IPython.display import display
 import matplotlib.pyplot as plt
 import torch
 import torchvision.transforms as transforms
@@ -9,7 +10,7 @@ from tqdm import tqdm
 from modeling import *
 
 
-def caption_dataset(ds, model, device, out_name):
+def caption_coco(ds, model, device, out_name):
     with torch.no_grad():
         outs = []
 
@@ -22,6 +23,22 @@ def caption_dataset(ds, model, device, out_name):
 
             out = model.generate(img, max_new_tokens=64, do_sample=False, top_p=None, temperature=None)
             outs.append(out)
+
+        with open(out_name, 'w') as f:
+            json.dump(outs, f, indent=4)
+
+
+def caption_app(dl, model, out_name):
+    with torch.no_grad():
+        outs = []
+
+        for data in tqdm(dl, desc="Generating captions", total=len(dl)):
+            image_batches, [hints, labels] = data
+
+            out = model.generate(image_batches, max_new_tokens=1024, do_sample=True, temperature=0.8, repetition_penalty=1.2)
+
+            outs.append(out)
+            break
 
         with open(out_name, 'w') as f:
             json.dump(outs, f, indent=4)
@@ -61,6 +78,45 @@ def score_single(out, ann, do_print=False):
     return {**bleu_score, **meteor_score, **rouge_score}
 
 
+def app_single(llama_model, ds, index, device, preview_image_count=1):
+    if index == -1:
+        index = torch.randint(0, len(ds), (1,)).item()
+
+    imgs, [hint, description] = ds[index]
+
+    # Only works in Jupyter
+    try:
+        display_imgs = [transforms.functional.to_pil_image(img) for img in imgs][:preview_image_count]
+        display(*display_imgs)
+    except NameError:
+        pass
+
+    print(f'Index: {index}\n')
+    print(f"{hint}{description}")
+    print("\n" + "-" * 80)
+
+    if hasattr(llama_model, 'vit_processor'):
+        img_in = llama_model.vit_processor(imgs, return_tensors='pt').pixel_values
+        img_batch = img_in.unsqueeze(1).to(device)
+    else:
+        img_batch = None
+
+    hint_tokens = llama_model.tokenizer(hint, return_tensors='pt').input_ids[0].to(device).unsqueeze(0)
+
+    out = llama_model.generate(
+        img_batch,
+        hints=hint_tokens,
+        max_new_tokens=1024,
+        do_sample=True,
+        temperature=0.1,
+        top_k=50,
+        top_p=0.1,
+        repetition_penalty=1.1
+    )
+
+    print(f"{hint}{out}")
+
+
 def coco_single_compare(llama_model, ved_model, ds, index, device):
     if index == -1:
         index = torch.randint(0, len(ds), (1,)).item()
@@ -97,6 +153,9 @@ def coco_single_compare(llama_model, ved_model, ds, index, device):
 def coco_eval_scores(ds, out_name):
     with open(out_name) as f:
         outs = json.load(f)
+
+    # replace " " with "None" in the annotations
+    outs = [x if x.strip() != "" else "None" for x in outs]
 
     scores = []
 
@@ -212,20 +271,13 @@ def lineplot_scores(score_dict, title):
 
 
 def boxplot_similarities(
-    ds_similarities,
-    ved_similarities,
     similarities,
-    ds_avg_sim,
-    ved_avg_sim,
-    avg_sim
+    avg_sims,
+    names
 ):
     fig, ax = plt.subplots()
-    ax.boxplot([ds_similarities, ved_similarities, similarities], showfliers=False)
+    ax.boxplot(similarities, showfliers=False)
     # add means
-    ax.plot([1, 2, 3], [
-        ds_avg_sim,
-        ved_avg_sim,
-        avg_sim
-    ], 'ro')
-    ax.set_xticklabels(['DS', 'VED', 'Llama'])
+    ax.plot(range(len(similarities)), avg_sims, 'ro')
+    ax.set_xticklabels(names)
     plt.show()

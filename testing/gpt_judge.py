@@ -2,6 +2,7 @@ import json
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from pydantic import BaseModel
 import torch
 import torchvision.datasets as dset
 from tqdm import tqdm
@@ -11,8 +12,8 @@ load_dotenv()
 client = OpenAI()
 
 model = "gpt-4o-2024-08-06"
-captions_file = "captions/val_224_no_merge.json"
-out_file = "captions/llama_odd_one_out.json"
+captions_file = "captions/finetune.json"
+out_file = "captions/finetune_odd_one_out.json"
 
 # Example
 # captions = [
@@ -25,22 +26,25 @@ out_file = "captions/llama_odd_one_out.json"
 # ]
 
 
+class ResponseInt(BaseModel):
+    response: int
+
+
 def odd_one_out(captions):
     caption_message = "Which caption is the least relevant to the image?\n\n"
     caption_message += "\n".join([f"{i+1}. {caption}" for i, caption in enumerate(captions)])
 
-    response = client.chat.completions.create(
+    response = client.beta.chat.completions.parse(
         model=model,
         messages=[
-            # {"role": "system", "content": "You are a summary assistant, skilled in summarizing posts and comments. Ensure the generated summary is concise and captures the essence of the content."},
             {"role": "system", "content": "You are a judge. You judge relevance of the captions to an image not available to you. You play the odd-one-out game. You are provided with multiple captions for a single image. You have to find the least relevant caption, which is not describing the same image as the other captions. Only answer with the number of the least relevant caption. Do not provide any other information, only the number itself."},
             {"role": "user", "content": caption_message}
         ],
         temperature=0,
-        stream=False
-    )
+        response_format=ResponseInt
+    ).choices[0].message.content
 
-    return response.choices[0].message.content
+    return json.loads(response)["response"]
 
 
 ds = dset.CocoCaptions(
@@ -58,13 +62,11 @@ for i in tqdm(range(len(all_captions)), desc="Odd one out"):
     insert_index = torch.randint(0, len(captions), (1,)).item()
     captions = captions[:insert_index] + [all_captions[i]] + captions[insert_index:]
 
-    response = odd_one_out(captions).strip().replace(".", "")
-    correct = response == str(insert_index + 1)
-    parse_issue = not response.isdigit()
+    response = odd_one_out(captions)
+    correct = response == insert_index + 1
 
     out.append({
-        "index": i,
-        "parse_issue": parse_issue,
+        "id": i,
         "correct": correct,
         "response": response,
         "insert_index": insert_index + 1,
@@ -74,8 +76,5 @@ for i in tqdm(range(len(all_captions)), desc="Odd one out"):
 with open(out_file, "w") as f:
     json.dump(out, f, indent=4)
 
-issue_indices = [i for i, x in enumerate(out) if x["parse_issue"]]
-
-print(f"{len(issue_indices)} Parse issues: {issue_indices}")
 print(f"GPT Accuracy (lower is better): {sum(x['correct'] for x in out) / len(out)}")
 print(f"Random accuracy: {1 / 6:.4f}")

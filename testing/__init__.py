@@ -1,5 +1,7 @@
 from .test_utils import (
-    caption_dataset,
+    caption_coco,
+    caption_app,
+    app_single,
     coco_single_compare,
     coco_eval_avg,
     get_similarities,
