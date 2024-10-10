@@ -5,6 +5,8 @@ from .test_utils import (
     coco_single_compare,
     coco_eval_avg,
     get_similarities,
+    get_app_similarities,
+    get_empty_similarities,
     get_similarities_avg,
     get_intra_similarities,
     get_intra_similarities_avg,

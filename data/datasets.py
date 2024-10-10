@@ -245,11 +245,15 @@ class AppDataLoader(torch.utils.data.DataLoader):
             hints = self._batch_tokenize(hints)
             descriptions = self._batch_tokenize(descriptions)
         else:
-            hints = torch.stack(hints, dim=0)
-            descriptions = torch.stack(descriptions, dim=0)
+            try:
+                hints = torch.stack(hints, dim=0)
+                descriptions = torch.stack(descriptions, dim=0)
+            except TypeError:
+                pass
 
-        hints = hints.to(self.device)
-        descriptions = descriptions.to(self.device)
+        if self.device is not None:
+            hints = hints.to(self.device)
+            descriptions = descriptions.to(self.device)
 
         return images, [hints, descriptions]
 

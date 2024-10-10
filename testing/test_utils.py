@@ -33,12 +33,20 @@ def caption_app(dl, model, out_name):
         outs = []
 
         for data in tqdm(dl, desc="Generating captions", total=len(dl)):
-            image_batches, [hints, labels] = data
+            image_batches, [hints, descriptions] = data
 
-            out = model.generate(image_batches, max_new_tokens=1024, do_sample=True, temperature=0.8, repetition_penalty=1.2)
+            out = model.generate(
+                image_batches,
+                hints=hints,
+                max_new_tokens=1024,
+                do_sample=True,
+                temperature=0.1,
+                top_k=50,
+                top_p=0.1,
+                repetition_penalty=1.1
+            )
 
             outs.append(out)
-            break
 
         with open(out_name, 'w') as f:
             json.dump(outs, f, indent=4)
@@ -187,6 +195,46 @@ def get_similarities(model, ds, captions):
     return similarities
 
 
+def get_app_similarities(model, target, source):
+    similarities = []
+
+    for i in tqdm(range(0, len(target)), desc="Calculating similarities"):
+        target_embedding = model.encode(target[i])
+        source_embeddings = model.encode(source[i])
+
+        similarities.append(model.similarity(target_embedding, source_embeddings).squeeze())
+
+    return similarities
+
+
+def get_random_app_similarities(model, target):
+    similarities = []
+
+    for i in tqdm(range(0, len(target)), desc="Calculating similarities"):
+        index = torch.randint(0, len(target), (1,)).item()
+        while index == i:
+            index = torch.randint(0, len(target), (1,)).item()
+
+        target_embedding = model.encode(target[i])
+        source_embedding = model.encode(target[index])
+
+        similarities.append(model.similarity(target_embedding, source_embedding).squeeze())
+
+    return similarities
+
+
+def get_empty_similarities(model, target):
+    similarities = []
+
+    for i in tqdm(range(0, len(target)), desc="Calculating similarities"):
+        target_embedding = model.encode(target[i])
+        source_embedding = model.encode("")
+
+        similarities.append(model.similarity(target_embedding, source_embedding).squeeze())
+
+    return similarities
+
+
 def get_similarities_avg(model, ds, captions):
     similarities = get_similarities(model, ds, captions)
 
@@ -278,6 +326,7 @@ def boxplot_similarities(
     fig, ax = plt.subplots()
     ax.boxplot(similarities, showfliers=False)
     # add means
-    ax.plot(range(len(similarities)), avg_sims, 'ro')
+    ax.plot(range(1, len(similarities) + 1), avg_sims, 'ro')
     ax.set_xticklabels(names)
+    plt.xticks(rotation=30)
     plt.show()
