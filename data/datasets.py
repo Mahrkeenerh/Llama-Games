@@ -193,14 +193,15 @@ class CocoDataset(DatasetBase):
             self.labels[idx][i] = self._tokenize(ann[i])
         label = self.labels[idx][i]
 
-        return [image], label
+        return [image], ['', label]
 
 
 class AppDataLoader(torch.utils.data.DataLoader):
     def __init__(
         self,
         dataset,
-        batch_size,
+        hints=True,
+        batch_size=1,
         shuffle=True,
         image_size=448,
         processor=None,
@@ -209,6 +210,8 @@ class AppDataLoader(torch.utils.data.DataLoader):
         device=None,
         sampler=None
     ):
+        self.hints = hints
+
         self.image_size = image_size
         self.processor = processor
 
@@ -235,27 +238,37 @@ class AppDataLoader(torch.utils.data.DataLoader):
 
     def collate_fn(self, batch):
         images, labels = zip(*list(batch))
-        hints, descriptions = zip(*labels)
+        if self.hints:
+            hints, descriptions = zip(*labels)
 
         if self.processor is not None:
             images = self._image_preprocess(images)
             images = images.to(self.device)
 
         if self.tokenizer is not None:
-            hints = self._batch_tokenize(hints)
-            descriptions = self._batch_tokenize(descriptions)
+            if self.hints:
+                hints = self._batch_tokenize(hints)
+                descriptions = self._batch_tokenize(descriptions)
+            else:
+                labels = self._batch_tokenize(labels)
         else:
             try:
-                hints = torch.stack(hints, dim=0)
-                descriptions = torch.stack(descriptions, dim=0)
+                if self.hints:
+                    hints = torch.stack(hints, dim=0)
+                    descriptions = torch.stack(descriptions, dim=0)
+                else:
+                    labels = torch.stack(labels, dim=0)
             except TypeError:
                 pass
 
         if self.device is not None:
-            hints = hints.to(self.device)
-            descriptions = descriptions.to(self.device)
+            if self.hints:
+                hints = hints.to(self.device)
+                descriptions = descriptions.to(self.device)
+            else:
+                labels = labels.to(self.device)
 
-        return images, [hints, descriptions]
+        return images, [hints, descriptions] if self.hints else labels
 
     def _image_preprocess(self, images):
         """Preprocess images using the processor.
@@ -417,6 +430,7 @@ def load_coco_data(
     dataloader_tokenizer = tokenizer if minibatch_size != 1 else None
     train_loader = AppDataLoader(
         train_ds,
+        hints=False,
         batch_size=minibatch_size,
         shuffle=False,
         processor=processor,
@@ -428,6 +442,7 @@ def load_coco_data(
 
     val_loader = AppDataLoader(
         val_ds,
+        hints=False,
         batch_size=minibatch_size,
         shuffle=False,
         processor=processor,
